@@ -111,4 +111,53 @@ impl DiskStorage {
         self.heap_file.sync_data()?;
         Ok(())
     }
+
+    /// Atomically replaces `nodes.db` and `heap.db` with compacted files and reopens handles.
+    pub fn replace_with_compacted(
+        &mut self,
+        dir: &Path,
+        new_nodes_path: &Path,
+        new_heap_path: &Path,
+    ) -> Result<(), HdbError> {
+        // Close existing file descriptors before renaming (required on Windows, clean on Unix)
+        let dummy_nodes = OpenOptions::new().read(true).open(new_nodes_path)?;
+        let dummy_heap = OpenOptions::new().read(true).open(new_heap_path)?;
+        self.nodes_file = dummy_nodes;
+        self.heap_file = dummy_heap;
+
+        std::fs::rename(new_nodes_path, dir.join("nodes.db"))?;
+        std::fs::rename(new_heap_path, dir.join("heap.db"))?;
+
+        self.nodes_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("nodes.db"))?;
+        self.heap_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("heap.db"))?;
+
+        Ok(())
+    }
+
+    /// Reads the entire contents of `nodes.db` and `heap.db` for base backup snapshots.
+    pub fn read_all_files(&self) -> Result<(Vec<u8>, Vec<u8>), HdbError> {
+        let node_bytes_len = self.nodes_file.metadata()?.len() as usize;
+        let mut nodes_buf = vec![0u8; node_bytes_len];
+        if !nodes_buf.is_empty() {
+            read_exact_at(&self.nodes_file, &mut nodes_buf, 0)?;
+        }
+
+        let heap_bytes_len = self.heap_file.metadata()?.len() as usize;
+        let mut heap_buf = vec![0u8; heap_bytes_len];
+        if !heap_buf.is_empty() {
+            read_exact_at(&self.heap_file, &mut heap_buf, 0)?;
+        }
+
+        Ok((nodes_buf, heap_buf))
+    }
 }

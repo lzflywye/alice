@@ -1,6 +1,7 @@
+use alice_core::db::{BaseSnapshot, NodeView, VacuumStats};
 use alice_core::error::HdbError;
 use alice_core::node::NODE_SLOT_SIZE;
-use alice_core::schema::{ColumnDef, DataType, SegmentSchema, Value};
+use alice_core::schema::{ColumnDef, DataType, Decimal, SegmentSchema, Value};
 use alice_core::wal::{WalEntry, WalOp};
 use std::io::{Read, Write};
 
@@ -17,6 +18,14 @@ pub enum MsgTag {
     FetchWal = 8,
     SyncCatalog = 9,
     Promote = 10,
+    FetchSnapshot = 11,
+    FindByIndex = 12,
+    WalkSubtree = 13,
+    Vacuum = 14,
+
+    // SCRAM-SHA-256 Handshake Requests
+    AuthHello = 20,
+    AuthProof = 21,
 
     OkEmpty = 100,
     OkNodeId = 101,
@@ -24,6 +33,14 @@ pub enum MsgTag {
     OkNodeIds = 103,
     OkWalBatch = 104,
     OkCatalog = 105,
+    OkSnapshot = 106,
+    OkNodeViews = 107,
+    OkVacuum = 108,
+
+    // SCRAM-SHA-256 Handshake Responses
+    AuthChallenge = 120,
+    AuthSuccess = 121,
+
     ErrResponse = 255,
 }
 
@@ -41,12 +58,23 @@ impl TryFrom<u8> for MsgTag {
             8 => Ok(MsgTag::FetchWal),
             9 => Ok(MsgTag::SyncCatalog),
             10 => Ok(MsgTag::Promote),
+            11 => Ok(MsgTag::FetchSnapshot),
+            12 => Ok(MsgTag::FindByIndex),
+            13 => Ok(MsgTag::WalkSubtree),
+            14 => Ok(MsgTag::Vacuum),
+            20 => Ok(MsgTag::AuthHello),
+            21 => Ok(MsgTag::AuthProof),
             100 => Ok(MsgTag::OkEmpty),
             101 => Ok(MsgTag::OkNodeId),
             102 => Ok(MsgTag::OkRecord),
             103 => Ok(MsgTag::OkNodeIds),
             104 => Ok(MsgTag::OkWalBatch),
             105 => Ok(MsgTag::OkCatalog),
+            106 => Ok(MsgTag::OkSnapshot),
+            107 => Ok(MsgTag::OkNodeViews),
+            108 => Ok(MsgTag::OkVacuum),
+            120 => Ok(MsgTag::AuthChallenge),
+            121 => Ok(MsgTag::AuthSuccess),
             255 => Ok(MsgTag::ErrResponse),
             _ => Err(HdbError::CorruptedData("Unknown RPC message tag")),
         }
@@ -80,20 +108,51 @@ pub enum Request {
     },
     SyncCatalog,
     Promote,
+    FetchSnapshot,
+    FindByIndex {
+        node_type: u16,
+        col_name: String,
+        value: Value,
+    },
+    WalkSubtree {
+        root_node_id: u64,
+        max_depth: Option<usize>,
+    },
+    Vacuum,
+    AuthHello {
+        username: String,
+        client_nonce: Vec<u8>,
+    },
+    AuthProof {
+        client_proof: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum Response {
     OkEmpty,
     OkNodeId(u64),
-    OkRecord { node_type: u16, values: Vec<Value> },
+    OkRecord {
+        node_type: u16,
+        values: Vec<Value>,
+    },
     OkNodeIds(Vec<u64>),
     OkWalBatch(Vec<WalEntry>),
     OkCatalog(Vec<SegmentSchema>),
+    OkSnapshot(BaseSnapshot),
+    OkNodeViews(Vec<NodeView>),
+    OkVacuum(VacuumStats),
+    AuthChallenge {
+        salt: [u8; 16],
+        iterations: u32,
+        combined_nonce: Vec<u8>,
+    },
+    AuthSuccess {
+        server_signature: [u8; 32],
+    },
     Err(String),
 }
 
-/// Writes a length-prefixed binary frame: [frame_len: u32][tag: u8][body...]
 pub fn write_frame<W: Write>(w: &mut W, tag: MsgTag, body: &[u8]) -> Result<(), HdbError> {
     let frame_len = (1 + body.len()) as u32;
     w.write_all(&frame_len.to_le_bytes())?;
@@ -115,8 +174,6 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<(MsgTag, Vec<u8>), HdbError> {
     let tag = MsgTag::try_from(buf[0])?;
     Ok((tag, buf[1..].to_vec()))
 }
-
-// --- Binary Serialization Helpers ---
 
 pub fn encode_request(req: &Request) -> (MsgTag, Vec<u8>) {
     let mut b = Vec::new();
@@ -159,6 +216,48 @@ pub fn encode_request(req: &Request) -> (MsgTag, Vec<u8>) {
         }
         Request::SyncCatalog => (MsgTag::SyncCatalog, b),
         Request::Promote => (MsgTag::Promote, b),
+        Request::FetchSnapshot => (MsgTag::FetchSnapshot, b),
+        Request::FindByIndex {
+            node_type,
+            col_name,
+            value,
+        } => {
+            b.extend_from_slice(&node_type.to_le_bytes());
+            write_str(&mut b, col_name);
+            write_single_value(&mut b, value);
+            (MsgTag::FindByIndex, b)
+        }
+        Request::WalkSubtree {
+            root_node_id,
+            max_depth,
+        } => {
+            b.extend_from_slice(&root_node_id.to_le_bytes());
+            match max_depth {
+                Some(d) => {
+                    b.push(1);
+                    b.extend_from_slice(&(*d as u32).to_le_bytes());
+                }
+                None => {
+                    b.push(0);
+                    b.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            (MsgTag::WalkSubtree, b)
+        }
+        Request::Vacuum => (MsgTag::Vacuum, b),
+        Request::AuthHello {
+            username,
+            client_nonce,
+        } => {
+            write_str(&mut b, username);
+            b.extend_from_slice(&(client_nonce.len() as u32).to_le_bytes());
+            b.extend_from_slice(client_nonce);
+            (MsgTag::AuthHello, b)
+        }
+        Request::AuthProof { client_proof } => {
+            b.extend_from_slice(client_proof);
+            (MsgTag::AuthProof, b)
+        }
     }
 }
 
@@ -196,6 +295,44 @@ pub fn decode_request(tag: MsgTag, buf: &[u8]) -> Result<Request, HdbError> {
         }),
         MsgTag::SyncCatalog => Ok(Request::SyncCatalog),
         MsgTag::Promote => Ok(Request::Promote),
+        MsgTag::FetchSnapshot => Ok(Request::FetchSnapshot),
+        MsgTag::FindByIndex => {
+            let node_type = read_u16(buf, &mut cur)?;
+            let col_name = read_str(buf, &mut cur)?;
+            let value = read_single_value(buf, &mut cur)?;
+            Ok(Request::FindByIndex {
+                node_type,
+                col_name,
+                value,
+            })
+        }
+        MsgTag::WalkSubtree => {
+            let root_node_id = read_u64(buf, &mut cur)?;
+            let has_depth = read_u8(buf, &mut cur)? != 0;
+            let raw_depth = read_u32(buf, &mut cur)? as usize;
+            let max_depth = if has_depth { Some(raw_depth) } else { None };
+            Ok(Request::WalkSubtree {
+                root_node_id,
+                max_depth,
+            })
+        }
+        MsgTag::Vacuum => Ok(Request::Vacuum),
+        MsgTag::AuthHello => {
+            let username = read_str(buf, &mut cur)?;
+            let nonce_len = read_u32(buf, &mut cur)? as usize;
+            let client_nonce = read_bytes(buf, &mut cur, nonce_len)?;
+            Ok(Request::AuthHello {
+                username,
+                client_nonce,
+            })
+        }
+        MsgTag::AuthProof => {
+            let raw = read_bytes(buf, &mut cur, 32)?;
+            let client_proof: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| HdbError::CorruptedData("Invalid AuthProof length"))?;
+            Ok(Request::AuthProof { client_proof })
+        }
         _ => Err(HdbError::CorruptedData(
             "Unexpected response tag as request",
         )),
@@ -251,6 +388,51 @@ pub fn encode_response(resp: &Response) -> (MsgTag, Vec<u8>) {
                 write_schema(&mut b, s);
             }
             (MsgTag::OkCatalog, b)
+        }
+        Response::OkSnapshot(snap) => {
+            b.extend_from_slice(&snap.snapshot_lsn.to_le_bytes());
+            b.extend_from_slice(&(snap.schemas.len() as u32).to_le_bytes());
+            for s in &snap.schemas {
+                write_schema(&mut b, s);
+            }
+            b.extend_from_slice(&(snap.nodes_bytes.len() as u64).to_le_bytes());
+            b.extend_from_slice(&snap.nodes_bytes);
+            b.extend_from_slice(&(snap.heap_bytes.len() as u64).to_le_bytes());
+            b.extend_from_slice(&snap.heap_bytes);
+            (MsgTag::OkSnapshot, b)
+        }
+        Response::OkNodeViews(views) => {
+            b.extend_from_slice(&(views.len() as u32).to_le_bytes());
+            for v in views {
+                b.extend_from_slice(&v.node_id.to_le_bytes());
+                b.extend_from_slice(&v.parent_id.to_le_bytes());
+                b.extend_from_slice(&(v.depth as u32).to_le_bytes());
+                b.extend_from_slice(&v.node_type.to_le_bytes());
+                write_values(&mut b, &v.values);
+            }
+            (MsgTag::OkNodeViews, b)
+        }
+        Response::OkVacuum(stats) => {
+            b.extend_from_slice(&stats.active_nodes.to_le_bytes());
+            b.extend_from_slice(&stats.old_slot_capacity.to_le_bytes());
+            b.extend_from_slice(&stats.old_heap_bytes.to_le_bytes());
+            b.extend_from_slice(&stats.new_heap_bytes.to_le_bytes());
+            (MsgTag::OkVacuum, b)
+        }
+        Response::AuthChallenge {
+            salt,
+            iterations,
+            combined_nonce,
+        } => {
+            b.extend_from_slice(salt);
+            b.extend_from_slice(&iterations.to_le_bytes());
+            b.extend_from_slice(&(combined_nonce.len() as u32).to_le_bytes());
+            b.extend_from_slice(combined_nonce);
+            (MsgTag::AuthChallenge, b)
+        }
+        Response::AuthSuccess { server_signature } => {
+            b.extend_from_slice(server_signature);
+            (MsgTag::AuthSuccess, b)
         }
         Response::Err(msg) => {
             write_str(&mut b, msg);
@@ -314,6 +496,76 @@ pub fn decode_response(tag: MsgTag, buf: &[u8]) -> Result<Response, HdbError> {
             }
             Ok(Response::OkCatalog(schemas))
         }
+        MsgTag::OkSnapshot => {
+            let snapshot_lsn = read_u64(buf, &mut cur)?;
+            let schema_count = read_u32(buf, &mut cur)? as usize;
+            let mut schemas = Vec::with_capacity(schema_count);
+            for _ in 0..schema_count {
+                schemas.push(read_schema(buf, &mut cur)?);
+            }
+            let nodes_len = read_u64(buf, &mut cur)? as usize;
+            let nodes_bytes = read_bytes(buf, &mut cur, nodes_len)?;
+            let heap_len = read_u64(buf, &mut cur)? as usize;
+            let heap_bytes = read_bytes(buf, &mut cur, heap_len)?;
+            Ok(Response::OkSnapshot(BaseSnapshot {
+                snapshot_lsn,
+                schemas,
+                nodes_bytes,
+                heap_bytes,
+            }))
+        }
+        MsgTag::OkNodeViews => {
+            let count = read_u32(buf, &mut cur)? as usize;
+            let mut views = Vec::with_capacity(count);
+            for _ in 0..count {
+                let node_id = read_u64(buf, &mut cur)?;
+                let parent_id = read_u64(buf, &mut cur)?;
+                let depth = read_u32(buf, &mut cur)? as usize;
+                let node_type = read_u16(buf, &mut cur)?;
+                let values = read_values(buf, &mut cur)?;
+                views.push(NodeView {
+                    node_id,
+                    parent_id,
+                    depth,
+                    node_type,
+                    values,
+                });
+            }
+            Ok(Response::OkNodeViews(views))
+        }
+        MsgTag::OkVacuum => {
+            let active_nodes = read_u64(buf, &mut cur)?;
+            let old_slot_capacity = read_u64(buf, &mut cur)?;
+            let old_heap_bytes = read_u64(buf, &mut cur)?;
+            let new_heap_bytes = read_u64(buf, &mut cur)?;
+            Ok(Response::OkVacuum(VacuumStats {
+                active_nodes,
+                old_slot_capacity,
+                old_heap_bytes,
+                new_heap_bytes,
+            }))
+        }
+        MsgTag::AuthChallenge => {
+            let raw_salt = read_bytes(buf, &mut cur, 16)?;
+            let salt: [u8; 16] = raw_salt
+                .try_into()
+                .map_err(|_| HdbError::CorruptedData("Invalid AuthChallenge salt"))?;
+            let iterations = read_u32(buf, &mut cur)?;
+            let nonce_len = read_u32(buf, &mut cur)? as usize;
+            let combined_nonce = read_bytes(buf, &mut cur, nonce_len)?;
+            Ok(Response::AuthChallenge {
+                salt,
+                iterations,
+                combined_nonce,
+            })
+        }
+        MsgTag::AuthSuccess => {
+            let raw_sig = read_bytes(buf, &mut cur, 32)?;
+            let server_signature: [u8; 32] = raw_sig
+                .try_into()
+                .map_err(|_| HdbError::CorruptedData("Invalid AuthSuccess signature"))?;
+            Ok(Response::AuthSuccess { server_signature })
+        }
         MsgTag::ErrResponse => Ok(Response::Err(read_str(buf, &mut cur)?)),
         _ => Err(HdbError::CorruptedData(
             "Unexpected request tag as response",
@@ -353,7 +605,17 @@ fn write_schema(b: &mut Vec<u8>, s: &SegmentSchema) {
         write_str(b, &c.name);
         b.push(c.data_type.type_tag());
         b.extend_from_slice(&c.data_type.type_param().to_le_bytes());
-        b.push(if c.nullable { 1 } else { 0 });
+        let mut flags = 0u8;
+        if c.nullable {
+            flags |= 1 << 0;
+        }
+        if c.indexed {
+            flags |= 1 << 1;
+        }
+        if c.unique {
+            flags |= 1 << 2;
+        }
+        b.push(flags);
     }
 }
 
@@ -369,11 +631,13 @@ fn read_schema(buf: &[u8], cur: &mut usize) -> Result<SegmentSchema, HdbError> {
         let col_name = read_str(buf, cur)?;
         let tag = read_u8(buf, cur)?;
         let param = read_u16(buf, cur)?;
-        let nullable = read_u8(buf, cur)? != 0;
+        let flags = read_u8(buf, cur)?;
         columns.push(ColumnDef {
             name: col_name,
             data_type: DataType::from_raw(tag, param)?,
-            nullable,
+            nullable: (flags & (1 << 0)) != 0,
+            indexed: (flags & (1 << 1)) != 0,
+            unique: (flags & (1 << 2)) != 0,
         });
     }
     Ok(SegmentSchema {
@@ -384,33 +648,78 @@ fn read_schema(buf: &[u8], cur: &mut usize) -> Result<SegmentSchema, HdbError> {
     })
 }
 
+fn write_single_value(b: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Null => b.push(0),
+        Value::Bool(v) => {
+            b.push(1);
+            b.push(if *v { 1 } else { 0 });
+        }
+        Value::I64(v) => {
+            b.push(2);
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::F64(v) => {
+            b.push(3);
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::String(s) => {
+            b.push(4);
+            write_str(b, s);
+        }
+        Value::Bytes(raw) => {
+            b.push(5);
+            b.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            b.extend_from_slice(raw);
+        }
+        Value::Decimal(d) => {
+            b.push(6);
+            b.push(d.scale);
+            b.extend_from_slice(&d.unscaled.to_le_bytes());
+        }
+    }
+}
+
+fn read_single_value(buf: &[u8], cur: &mut usize) -> Result<Value, HdbError> {
+    let tag = read_u8(buf, cur)?;
+    match tag {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Bool(read_u8(buf, cur)? != 0)),
+        2 => {
+            let arr: [u8; 8] = read_bytes(buf, cur, 8)?
+                .try_into()
+                .map_err(|_| HdbError::CorruptedData("Invalid I64 in RPC"))?;
+            Ok(Value::I64(i64::from_le_bytes(arr)))
+        }
+        3 => {
+            let arr: [u8; 8] = read_bytes(buf, cur, 8)?
+                .try_into()
+                .map_err(|_| HdbError::CorruptedData("Invalid F64 in RPC"))?;
+            Ok(Value::F64(f64::from_le_bytes(arr)))
+        }
+        4 => Ok(Value::String(read_str(buf, cur)?)),
+        5 => {
+            let len = read_u32(buf, cur)? as usize;
+            Ok(Value::Bytes(read_bytes(buf, cur, len)?))
+        }
+        6 => {
+            let scale = read_u8(buf, cur)?;
+            let arr: [u8; 16] = read_bytes(buf, cur, 16)?
+                .try_into()
+                .map_err(|_| HdbError::CorruptedData("Invalid Decimal in RPC"))?;
+            Ok(Value::Decimal(Decimal {
+                unscaled: i128::from_le_bytes(arr),
+                scale,
+            }))
+        }
+        _ => Err(HdbError::CorruptedData("Invalid Value tag in RPC")),
+    }
+}
+
 fn write_values(b: &mut Vec<u8>, values: &[Value]) {
     b.extend_from_slice(&(values.len() as u16).to_le_bytes());
     for v in values {
-        match v {
-            Value::Null => b.push(0),
-            Value::Bool(v) => {
-                b.push(1);
-                b.push(if *v { 1 } else { 0 });
-            }
-            Value::I64(v) => {
-                b.push(2);
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            Value::F64(v) => {
-                b.push(3);
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            Value::String(s) => {
-                b.push(4);
-                write_str(b, s);
-            }
-            Value::Bytes(raw) => {
-                b.push(5);
-                b.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-                b.extend_from_slice(raw);
-            }
-        }
+        write_single_value(b, v);
     }
 }
 
@@ -418,24 +727,7 @@ fn read_values(buf: &[u8], cur: &mut usize) -> Result<Vec<Value>, HdbError> {
     let count = read_u16(buf, cur)? as usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let tag = read_u8(buf, cur)?;
-        let v = match tag {
-            0 => Value::Null,
-            1 => Value::Bool(read_u8(buf, cur)? != 0),
-            2 => Value::I64(i64::from_le_bytes(
-                read_bytes(buf, cur, 8)?.try_into().unwrap(),
-            )),
-            3 => Value::F64(f64::from_le_bytes(
-                read_bytes(buf, cur, 8)?.try_into().unwrap(),
-            )),
-            4 => Value::String(read_str(buf, cur)?),
-            5 => {
-                let len = read_u32(buf, cur)? as usize;
-                Value::Bytes(read_bytes(buf, cur, len)?)
-            }
-            _ => return Err(HdbError::CorruptedData("Invalid Value tag in RPC")),
-        };
-        out.push(v);
+        out.push(read_single_value(buf, cur)?);
     }
     Ok(out)
 }
@@ -451,17 +743,26 @@ fn read_u8(buf: &[u8], cur: &mut usize) -> Result<u8, HdbError> {
 
 fn read_u16(buf: &[u8], cur: &mut usize) -> Result<u16, HdbError> {
     let b = read_bytes(buf, cur, 2)?;
-    Ok(u16::from_le_bytes(b.try_into().unwrap()))
+    let arr: [u8; 2] = b
+        .try_into()
+        .map_err(|_| HdbError::CorruptedData("Invalid u16"))?;
+    Ok(u16::from_le_bytes(arr))
 }
 
 fn read_u32(buf: &[u8], cur: &mut usize) -> Result<u32, HdbError> {
     let b = read_bytes(buf, cur, 4)?;
-    Ok(u32::from_le_bytes(b.try_into().unwrap()))
+    let arr: [u8; 4] = b
+        .try_into()
+        .map_err(|_| HdbError::CorruptedData("Invalid u32"))?;
+    Ok(u32::from_le_bytes(arr))
 }
 
 fn read_u64(buf: &[u8], cur: &mut usize) -> Result<u64, HdbError> {
     let b = read_bytes(buf, cur, 8)?;
-    Ok(u64::from_le_bytes(b.try_into().unwrap()))
+    let arr: [u8; 8] = b
+        .try_into()
+        .map_err(|_| HdbError::CorruptedData("Invalid u64"))?;
+    Ok(u64::from_le_bytes(arr))
 }
 
 fn read_bytes(buf: &[u8], cur: &mut usize, len: usize) -> Result<Vec<u8>, HdbError> {

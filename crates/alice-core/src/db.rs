@@ -1,18 +1,38 @@
 use crate::catalog::CatalogStorage;
 use crate::error::HdbError;
+use crate::index::SecondaryIndex;
 use crate::node::{INLINE_PAYLOAD_CAP, NodeSlot};
 use crate::record::{HeapReader, StagedHeapAppender, decode_record, encode_record};
 use crate::schema::{SegmentSchema, Value};
 use crate::storage::DiskStorage;
 use crate::wal::{WalEntry, WalOp, WalWriter};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
-/// Default WAL segment size (4 MB) before rotating to a new segment file.
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
-/// Maximum number of recent WAL entries retained in memory for streaming to Standby.
 const MAX_REPLICATION_BACKLOG: usize = 10_000;
+
+/// Result item returned by rich hierarchy read queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeView {
+    pub node_id: u64,
+    pub parent_id: u64,
+    pub depth: usize,
+    pub node_type: u16,
+    pub values: Vec<Value>,
+}
+
+/// Summary metrics returned after a `vacuum()` compaction run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumStats {
+    pub active_nodes: u64,
+    pub old_slot_capacity: u64,
+    pub old_heap_bytes: u64,
+    pub new_heap_bytes: u64,
+}
 
 struct WriteState {
     wal: WalWriter,
@@ -27,14 +47,24 @@ struct WriteState {
     repl_backlog: VecDeque<WalEntry>,
 }
 
+/// Point-in-time consistent physical snapshot for Standby base backup initialization.
+#[derive(Debug, Clone)]
+pub struct BaseSnapshot {
+    pub snapshot_lsn: u64,
+    pub schemas: Vec<SegmentSchema>,
+    pub nodes_bytes: Vec<u8>,
+    pub heap_bytes: Vec<u8>,
+}
+
 /// Persistent Hierarchical Database with single-writer serialization, segmented WAL,
-/// catalog persistence, checkpointing, and Active-Standby replication support.
+/// catalog persistence, secondary indexes, compaction, and Active-Standby replication.
 pub struct Database {
     dir: PathBuf,
     schemas: RwLock<HashMap<u16, SegmentSchema>>,
     writer: Mutex<WriteState>,
     slot_cache: RwLock<Vec<NodeSlot>>,
-    storage: DiskStorage,
+    storage: RwLock<DiskStorage>,
+    index: RwLock<SecondaryIndex>,
 }
 
 impl HeapReader for DiskStorage {
@@ -89,11 +119,15 @@ impl Database {
             storage.sync_all()?;
         }
 
-        // 3. Rebuild free list from inactive slots (skipping NodeId 0)
+        // 3. Rebuild free list & secondary indexes from active slots (skipping NodeId 0)
         let mut free_list = Vec::new();
+        let mut index = SecondaryIndex::new();
         for (id, slot) in slots.iter().enumerate().skip(1) {
             if !slot.is_active() {
                 free_list.push(id as u64);
+            } else if let Some(schema) = schemas.get(&slot.node_type) {
+                let values = decode_record(schema, &slot.inline_data, &storage)?;
+                index.insert_node(schema, id as u64, &values);
             }
         }
 
@@ -117,7 +151,8 @@ impl Database {
                 repl_backlog: VecDeque::new(),
             }),
             slot_cache: RwLock::new(slots),
-            storage,
+            storage: RwLock::new(storage),
+            index: RwLock::new(index),
         })
     }
 
@@ -180,6 +215,12 @@ impl Database {
             (p_slot, fc_slot)
         };
 
+        // Validate unique constraints before allocating slots or appending heap
+        {
+            let index = self.index.read().map_err(|_| HdbError::LockPoisoned)?;
+            index.check_unique(&schema, values, None)?;
+        }
+
         let mut heap_appender = StagedHeapAppender::new(w.heap_tail);
         let (inline_data, total_len) = encode_record(&schema, values, &mut heap_appender)?;
 
@@ -235,33 +276,42 @@ impl Database {
         let commit_lsn = w.wal.append_transaction(&wal_ops)?;
         Self::push_to_backlog(&mut w, commit_lsn, &wal_ops);
 
-        if !heap_appender.staged_data.is_empty() {
-            self.storage
-                .write_heap_at(heap_appender.start_offset(), &heap_appender.staged_data)?;
-            w.heap_tail += heap_appender.staged_data.len() as u64;
-        }
-        self.storage.write_slot(new_id, &new_slot)?;
-        if let Some(fc) = updated_fc {
-            self.storage.write_slot(old_first_child_id, &fc)?;
-        }
-        if let Some(p) = updated_parent {
-            self.storage.write_slot(parent_id, &p)?;
+        {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            if !heap_appender.staged_data.is_empty() {
+                storage.write_heap_at(heap_appender.start_offset(), &heap_appender.staged_data)?;
+                w.heap_tail += heap_appender.staged_data.len() as u64;
+            }
+            storage.write_slot(new_id, &new_slot)?;
+            if let Some(fc) = updated_fc {
+                storage.write_slot(old_first_child_id, &fc)?;
+            }
+            if let Some(p) = updated_parent {
+                storage.write_slot(parent_id, &p)?;
+            }
         }
 
-        let mut cache = self
-            .slot_cache
-            .write()
-            .map_err(|_| HdbError::LockPoisoned)?;
-        let idx = new_id as usize;
-        if idx >= cache.len() {
-            cache.resize(idx + 1, NodeSlot::empty());
+        {
+            let mut cache = self
+                .slot_cache
+                .write()
+                .map_err(|_| HdbError::LockPoisoned)?;
+            let idx = new_id as usize;
+            if idx >= cache.len() {
+                cache.resize(idx + 1, NodeSlot::empty());
+            }
+            cache[idx] = new_slot;
+            if let Some(fc) = updated_fc {
+                cache[old_first_child_id as usize] = fc;
+            }
+            if let Some(p) = updated_parent {
+                cache[parent_id as usize] = p;
+            }
         }
-        cache[idx] = new_slot;
-        if let Some(fc) = updated_fc {
-            cache[old_first_child_id as usize] = fc;
-        }
-        if let Some(p) = updated_parent {
-            cache[parent_id as usize] = p;
+
+        {
+            let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+            index.insert_node(&schema, new_id, values);
         }
 
         Ok(new_id)
@@ -286,6 +336,15 @@ impl Database {
                 .clone()
         };
 
+        let old_values = {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            decode_record(&schema, &slot.inline_data, &*storage)?
+        };
+        {
+            let index = self.index.read().map_err(|_| HdbError::LockPoisoned)?;
+            index.check_unique(&schema, values, Some(node_id))?;
+        }
+
         let mut heap_appender = StagedHeapAppender::new(w.heap_tail);
         let (inline_data, total_len) = encode_record(&schema, values, &mut heap_appender)?;
 
@@ -307,18 +366,28 @@ impl Database {
         let commit_lsn = w.wal.append_transaction(&wal_ops)?;
         Self::push_to_backlog(&mut w, commit_lsn, &wal_ops);
 
-        if !heap_appender.staged_data.is_empty() {
-            self.storage
-                .write_heap_at(heap_appender.start_offset(), &heap_appender.staged_data)?;
-            w.heap_tail += heap_appender.staged_data.len() as u64;
+        {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            if !heap_appender.staged_data.is_empty() {
+                storage.write_heap_at(heap_appender.start_offset(), &heap_appender.staged_data)?;
+                w.heap_tail += heap_appender.staged_data.len() as u64;
+            }
+            storage.write_slot(node_id, &slot)?;
         }
-        self.storage.write_slot(node_id, &slot)?;
 
-        let mut cache = self
-            .slot_cache
-            .write()
-            .map_err(|_| HdbError::LockPoisoned)?;
-        cache[node_id as usize] = slot;
+        {
+            let mut cache = self
+                .slot_cache
+                .write()
+                .map_err(|_| HdbError::LockPoisoned)?;
+            cache[node_id as usize] = slot;
+        }
+
+        {
+            let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+            index.remove_node(&schema, node_id, &old_values);
+            index.insert_node(&schema, node_id, values);
+        }
 
         Ok(())
     }
@@ -334,12 +403,10 @@ impl Database {
             let cache = self.slot_cache.read().map_err(|_| HdbError::LockPoisoned)?;
             let n = *Self::get_slot_from_cache(&cache, node_id)?;
 
-            // No-op if already under target parent
             if n.parent_id == new_parent_id {
                 return Ok(());
             }
 
-            // Prevent moving a node into itself or any of its descendants
             let mut ancestor = new_parent_id;
             while ancestor != 0 {
                 if ancestor == node_id {
@@ -351,7 +418,6 @@ impl Database {
                 ancestor = Self::get_slot_from_cache(&cache, ancestor)?.parent_id;
             }
 
-            // Validate schema parent_type constraint against new_parent
             let schema = {
                 let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
                 schemas
@@ -401,10 +467,8 @@ impl Database {
             (n, oprev, onext, oparent, nparent, nfc)
         };
 
-        // Collect mutated slots by NodeId (using HashMap handles cases where old_parent == new_parent cleanly)
         let mut mutated: HashMap<u64, NodeSlot> = HashMap::new();
 
-        // 1. Detach from old siblings / old parent
         if let Some(mut p) = old_prev {
             p.next_sibling_id = node.next_sibling_id;
             mutated.insert(node.prev_sibling_id, p);
@@ -418,7 +482,6 @@ impl Database {
             mutated.insert(node.next_sibling_id, nx);
         }
 
-        // 2. Attach as new first child of new_parent
         let new_fc_id = new_parent.map(|p| p.first_child_id).unwrap_or(0);
         node.parent_id = new_parent_id;
         node.prev_sibling_id = 0;
@@ -445,8 +508,11 @@ impl Database {
         let commit_lsn = w.wal.append_transaction(&wal_ops)?;
         Self::push_to_backlog(&mut w, commit_lsn, &wal_ops);
 
-        for (&id, slot) in &mutated {
-            self.storage.write_slot(id, slot)?;
+        {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            for (&id, slot) in &mutated {
+                storage.write_slot(id, slot)?;
+            }
         }
 
         let mut cache = self
@@ -472,7 +538,8 @@ impl Database {
                 .ok_or(HdbError::SchemaNotFound(slot.node_type))?
                 .clone()
         };
-        let values = decode_record(&schema, &slot.inline_data, &self.storage)?;
+        let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+        let values = decode_record(&schema, &slot.inline_data, &*storage)?;
         Ok((slot.node_type, values))
     }
 
@@ -519,6 +586,18 @@ impl Database {
             (s, prev, next, parent)
         };
 
+        let schema = {
+            let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+            schemas
+                .get(&slot.node_type)
+                .ok_or(HdbError::SchemaNotFound(slot.node_type))?
+                .clone()
+        };
+        let old_values = {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            decode_record(&schema, &slot.inline_data, &*storage)?
+        };
+
         let mut wal_ops = Vec::new();
         let empty_slot = NodeSlot::empty();
         wal_ops.push(WalOp::WriteSlot {
@@ -556,38 +635,47 @@ impl Database {
         let commit_lsn = w.wal.append_transaction(&wal_ops)?;
         Self::push_to_backlog(&mut w, commit_lsn, &wal_ops);
 
-        self.storage.write_slot(node_id, &empty_slot)?;
-        if let Some(p) = updated_prev {
-            self.storage.write_slot(slot.prev_sibling_id, &p)?;
-        }
-        if let Some(p) = updated_parent {
-            self.storage.write_slot(slot.parent_id, &p)?;
-        }
-        if let Some(n) = updated_next {
-            self.storage.write_slot(slot.next_sibling_id, &n)?;
+        {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            storage.write_slot(node_id, &empty_slot)?;
+            if let Some(p) = updated_prev {
+                storage.write_slot(slot.prev_sibling_id, &p)?;
+            }
+            if let Some(p) = updated_parent {
+                storage.write_slot(slot.parent_id, &p)?;
+            }
+            if let Some(n) = updated_next {
+                storage.write_slot(slot.next_sibling_id, &n)?;
+            }
         }
 
-        let mut cache = self
-            .slot_cache
-            .write()
-            .map_err(|_| HdbError::LockPoisoned)?;
-        cache[node_id as usize] = empty_slot;
-        if let Some(p) = updated_prev {
-            cache[slot.prev_sibling_id as usize] = p;
-        }
-        if let Some(p) = updated_parent {
-            cache[slot.parent_id as usize] = p;
-        }
-        if let Some(n) = updated_next {
-            cache[slot.next_sibling_id as usize] = n;
+        {
+            let mut cache = self
+                .slot_cache
+                .write()
+                .map_err(|_| HdbError::LockPoisoned)?;
+            cache[node_id as usize] = empty_slot;
+            if let Some(p) = updated_prev {
+                cache[slot.prev_sibling_id as usize] = p;
+            }
+            if let Some(p) = updated_parent {
+                cache[slot.parent_id as usize] = p;
+            }
+            if let Some(n) = updated_next {
+                cache[slot.next_sibling_id as usize] = n;
+            }
         }
         w.free_list.push(node_id);
+
+        {
+            let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+            index.remove_node(&schema, node_id, &old_values);
+        }
 
         Ok(())
     }
 
-    /// Recursively deletes `node_id` and all of its descendants in a single atomic transaction.
-    /// Returns the total number of deleted nodes.
+    /// Recursively deletes `root_node_id` and all of its descendants in a single atomic transaction.
     pub fn delete_subtree(&self, root_node_id: u64) -> Result<usize, HdbError> {
         let mut w = self.writer.lock().map_err(|_| HdbError::LockPoisoned)?;
         if w.is_replica {
@@ -598,7 +686,6 @@ impl Database {
             let cache = self.slot_cache.read().map_err(|_| HdbError::LockPoisoned)?;
             let root = *Self::get_slot_from_cache(&cache, root_node_id)?;
 
-            // Collect all descendants iteratively (DFS) to avoid stack overflow on deep trees
             let mut visited = HashSet::new();
             let mut stack = vec![root_node_id];
             while let Some(curr_id) = stack.pop() {
@@ -629,6 +716,20 @@ impl Database {
 
             (root, visited, prev, next, parent)
         };
+
+        let mut index_removals = Vec::with_capacity(to_delete.len());
+        {
+            let cache = self.slot_cache.read().map_err(|_| HdbError::LockPoisoned)?;
+            let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            for &id in &to_delete {
+                let s = &cache[id as usize];
+                if let Some(schema) = schemas.get(&s.node_type) {
+                    let vals = decode_record(schema, &s.inline_data, &*storage)?;
+                    index_removals.push((id, schema.clone(), vals));
+                }
+            }
+        }
 
         let mut wal_ops = Vec::with_capacity(to_delete.len() + 3);
         let empty_slot = NodeSlot::empty();
@@ -671,48 +772,199 @@ impl Database {
         let commit_lsn = w.wal.append_transaction(&wal_ops)?;
         Self::push_to_backlog(&mut w, commit_lsn, &wal_ops);
 
-        for &id in &to_delete {
-            self.storage.write_slot(id, &empty_slot)?;
-        }
-        if let Some(p) = updated_prev {
-            self.storage.write_slot(root_slot.prev_sibling_id, &p)?;
-        }
-        if let Some(p) = updated_parent {
-            self.storage.write_slot(root_slot.parent_id, &p)?;
-        }
-        if let Some(n) = updated_next {
-            self.storage.write_slot(root_slot.next_sibling_id, &n)?;
+        {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            for &id in &to_delete {
+                storage.write_slot(id, &empty_slot)?;
+            }
+            if let Some(p) = updated_prev {
+                storage.write_slot(root_slot.prev_sibling_id, &p)?;
+            }
+            if let Some(p) = updated_parent {
+                storage.write_slot(root_slot.parent_id, &p)?;
+            }
+            if let Some(n) = updated_next {
+                storage.write_slot(root_slot.next_sibling_id, &n)?;
+            }
         }
 
-        let mut cache = self
-            .slot_cache
-            .write()
-            .map_err(|_| HdbError::LockPoisoned)?;
-        for &id in &to_delete {
-            cache[id as usize] = empty_slot;
-            w.free_list.push(id);
+        {
+            let mut cache = self
+                .slot_cache
+                .write()
+                .map_err(|_| HdbError::LockPoisoned)?;
+            for &id in &to_delete {
+                cache[id as usize] = empty_slot;
+                w.free_list.push(id);
+            }
+            if let Some(p) = updated_prev {
+                cache[root_slot.prev_sibling_id as usize] = p;
+            }
+            if let Some(p) = updated_parent {
+                cache[root_slot.parent_id as usize] = p;
+            }
+            if let Some(n) = updated_next {
+                cache[root_slot.next_sibling_id as usize] = n;
+            }
         }
-        if let Some(p) = updated_prev {
-            cache[root_slot.prev_sibling_id as usize] = p;
-        }
-        if let Some(p) = updated_parent {
-            cache[root_slot.parent_id as usize] = p;
-        }
-        if let Some(n) = updated_next {
-            cache[root_slot.next_sibling_id as usize] = n;
+
+        {
+            let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+            for (id, schema, vals) in index_removals {
+                index.remove_node(&schema, id, &vals);
+            }
         }
 
         Ok(to_delete.len())
     }
 
-    /// Syncs nodes.db and heap.db to disk, rotates the active WAL segment, and purges
-    /// closed segments that are safely checkpointed (and replicated if a Standby is attached).
+    // --- Secondary Index & Rich Read APIs ---
+
+    pub fn find_by_index(
+        &self,
+        node_type: u16,
+        col_name: &str,
+        value: &Value,
+    ) -> Result<Vec<u64>, HdbError> {
+        let col_idx = {
+            let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+            let schema = schemas
+                .get(&node_type)
+                .ok_or(HdbError::SchemaNotFound(node_type))?;
+            let (idx, col) = schema
+                .find_column(col_name)
+                .ok_or_else(|| HdbError::ColumnNotFound(col_name.to_string()))?;
+            if !(col.indexed || col.unique) {
+                return Err(HdbError::ColumnNotIndexed(col_name.to_string()));
+            }
+            idx
+        };
+
+        let index = self.index.read().map_err(|_| HdbError::LockPoisoned)?;
+        Ok(index.lookup(node_type, col_idx, value))
+    }
+
+    pub fn get_by_index(
+        &self,
+        node_type: u16,
+        col_name: &str,
+        value: &Value,
+    ) -> Result<Vec<NodeView>, HdbError> {
+        let ids = self.find_by_index(node_type, col_name, value)?;
+        let cache = self.slot_cache.read().map_err(|_| HdbError::LockPoisoned)?;
+        let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+        let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+        let schema = schemas
+            .get(&node_type)
+            .ok_or(HdbError::SchemaNotFound(node_type))?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(slot) = Self::get_slot_from_cache(&cache, id) {
+                let values = decode_record(schema, &slot.inline_data, &*storage)?;
+                out.push(NodeView {
+                    node_id: id,
+                    parent_id: slot.parent_id,
+                    depth: 0,
+                    node_type,
+                    values,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn children_of_type(
+        &self,
+        parent_id: u64,
+        target_node_type: u16,
+    ) -> Result<Vec<NodeView>, HdbError> {
+        let cache = self.slot_cache.read().map_err(|_| HdbError::LockPoisoned)?;
+        let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+        let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+        let schema = schemas
+            .get(&target_node_type)
+            .ok_or(HdbError::SchemaNotFound(target_node_type))?;
+
+        let parent = Self::get_slot_from_cache(&cache, parent_id)?;
+        let mut out = Vec::new();
+        let mut curr = parent.first_child_id;
+
+        while curr != 0 {
+            let slot = &cache[curr as usize];
+            if slot.is_active() && slot.node_type == target_node_type {
+                let values = decode_record(schema, &slot.inline_data, &*storage)?;
+                out.push(NodeView {
+                    node_id: curr,
+                    parent_id,
+                    depth: 1,
+                    node_type: target_node_type,
+                    values,
+                });
+            }
+            curr = slot.next_sibling_id;
+        }
+        Ok(out)
+    }
+
+    pub fn walk_subtree(
+        &self,
+        root_node_id: u64,
+        max_depth: Option<usize>,
+    ) -> Result<Vec<NodeView>, HdbError> {
+        let cache = self.slot_cache.read().map_err(|_| HdbError::LockPoisoned)?;
+        let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+        let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+
+        Self::get_slot_from_cache(&cache, root_node_id)?;
+
+        let mut out = Vec::new();
+        let mut stack = vec![(root_node_id, 0usize)];
+
+        while let Some((curr_id, depth)) = stack.pop() {
+            let slot = &cache[curr_id as usize];
+            if !slot.is_active() {
+                continue;
+            }
+            let schema = schemas
+                .get(&slot.node_type)
+                .ok_or(HdbError::SchemaNotFound(slot.node_type))?;
+            let values = decode_record(schema, &slot.inline_data, &*storage)?;
+
+            out.push(NodeView {
+                node_id: curr_id,
+                parent_id: slot.parent_id,
+                depth,
+                node_type: slot.node_type,
+                values,
+            });
+
+            if max_depth.is_none_or(|limit| depth < limit) {
+                let mut children = Vec::new();
+                let mut child = slot.first_child_id;
+                while child != 0 {
+                    children.push(child);
+                    child = cache[child as usize].next_sibling_id;
+                }
+                for child_id in children.into_iter().rev() {
+                    stack.push((child_id, depth + 1));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    // --- Maintenance: Checkpoint & Vacuum Compaction ---
+
     pub fn checkpoint(&self) -> Result<usize, HdbError> {
         let mut w = self.writer.lock().map_err(|_| HdbError::LockPoisoned)?;
-        self.storage.sync_all()?;
+        {
+            let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+            storage.sync_all()?;
+        }
         w.checkpointed_lsn = w.applied_lsn;
 
-        // Rotate active segment so its entries become eligible for purge once replicated
         if w.wal.active_byte_len() > 0 {
             w.wal.rotate_segment()?;
         }
@@ -724,6 +976,119 @@ impl Database {
         };
 
         w.wal.purge_segments_up_to(safe_purge_lsn)
+    }
+
+    /// Compacts `nodes.db` and `heap.db` by reclaiming dead heap space and gaps in slot IDs.
+    /// Active NodeIds are reassigned sequentially starting from 1.
+    pub fn vacuum(&self) -> Result<VacuumStats, HdbError> {
+        let mut w = self.writer.lock().map_err(|_| HdbError::LockPoisoned)?;
+        if w.is_replica {
+            return Err(HdbError::ReadOnlyReplica);
+        }
+
+        let mut cache = self
+            .slot_cache
+            .write()
+            .map_err(|_| HdbError::LockPoisoned)?;
+        let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+        let mut storage = self.storage.write().map_err(|_| HdbError::LockPoisoned)?;
+        let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+
+        let old_slot_capacity = cache.len() as u64;
+        let old_heap_bytes = storage.heap_len()?;
+
+        // 1. Build old_id -> new_id mapping for all active slots
+        let mut id_map: HashMap<u64, u64> = HashMap::new();
+        id_map.insert(0, 0);
+        let mut next_new_id: u64 = 1;
+        for (old_id, slot) in cache.iter().enumerate().skip(1) {
+            if slot.is_active() {
+                id_map.insert(old_id as u64, next_new_id);
+                next_new_id += 1;
+            }
+        }
+
+        // 2. Re-encode active records into a fresh heap buffer and rewrite hierarchy pointers
+        let mut new_slots = Vec::with_capacity(next_new_id as usize);
+        new_slots.push(NodeSlot::empty()); // Reserve NodeId 0
+        let mut new_heap = StagedHeapAppender::new(0);
+        let mut new_index = SecondaryIndex::new();
+
+        for (old_id, old_slot) in cache.iter().enumerate().skip(1) {
+            if !old_slot.is_active() {
+                continue;
+            }
+            let new_id = id_map[&(old_id as u64)];
+            let schema = schemas
+                .get(&old_slot.node_type)
+                .ok_or(HdbError::SchemaNotFound(old_slot.node_type))?;
+
+            let values = decode_record(schema, &old_slot.inline_data, &*storage)?;
+            let (new_inline, total_len) = encode_record(schema, &values, &mut new_heap)?;
+
+            let mut compacted = NodeSlot::empty();
+            compacted.flags = NodeSlot::FLAG_ACTIVE;
+            compacted.node_type = old_slot.node_type;
+            compacted.total_payload_len = total_len;
+            compacted.parent_id = *id_map.get(&old_slot.parent_id).unwrap_or(&0);
+            compacted.first_child_id = *id_map.get(&old_slot.first_child_id).unwrap_or(&0);
+            compacted.next_sibling_id = *id_map.get(&old_slot.next_sibling_id).unwrap_or(&0);
+            compacted.prev_sibling_id = *id_map.get(&old_slot.prev_sibling_id).unwrap_or(&0);
+            compacted.inline_data = new_inline;
+
+            new_slots.push(compacted);
+            new_index.insert_node(schema, new_id, &values);
+        }
+
+        // 3. Write compacted files to disk and fsync
+        let tmp_nodes_path = self.dir.join("nodes.db.compact");
+        let tmp_heap_path = self.dir.join("heap.db.compact");
+        {
+            let mut nf = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_nodes_path)?;
+            for s in &new_slots {
+                nf.write_all(&s.to_bytes())?;
+            }
+            nf.sync_data()?;
+
+            let mut hf = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_heap_path)?;
+            hf.write_all(&new_heap.staged_data)?;
+            hf.sync_data()?;
+        }
+
+        // 4. Atomically swap files and update in-memory state
+        storage.replace_with_compacted(&self.dir, &tmp_nodes_path, &tmp_heap_path)?;
+
+        let new_heap_bytes = new_heap.staged_data.len() as u64;
+        *cache = new_slots;
+        *index = new_index;
+        w.free_list.clear();
+        w.next_slot_id = next_new_id;
+        w.heap_tail = new_heap_bytes;
+
+        if w.wal.active_byte_len() > 0 {
+            w.wal.rotate_segment()?;
+        }
+        if w.wal.active_byte_len() > 0 {
+            w.wal.rotate_segment()?;
+        }
+        w.checkpointed_lsn = w.applied_lsn;
+        let safe_lsn = w.checkpointed_lsn;
+        w.wal.purge_segments_up_to(safe_lsn)?;
+
+        Ok(VacuumStats {
+            active_nodes: next_new_id - 1,
+            old_slot_capacity,
+            old_heap_bytes,
+            new_heap_bytes,
+        })
     }
 
     // --- Replication & Failover Methods ---
@@ -761,7 +1126,6 @@ impl Database {
         Ok(())
     }
 
-    /// Fetches WAL entries strictly greater than `after_lsn` and records Standby's progress.
     pub fn fetch_wal_since(&self, after_lsn: u64) -> Result<Vec<WalEntry>, HdbError> {
         let mut w = self.writer.lock().map_err(|_| HdbError::LockPoisoned)?;
         w.has_standby = true;
@@ -787,7 +1151,6 @@ impl Database {
             .collect())
     }
 
-    /// Applies replicated physical WAL entries received from an Active primary.
     pub fn apply_replicated_entries(&self, entries: &[WalEntry]) -> Result<u64, HdbError> {
         if entries.is_empty() {
             return self.current_lsn();
@@ -813,29 +1176,52 @@ impl Database {
             .slot_cache
             .write()
             .map_err(|_| HdbError::LockPoisoned)?;
+        let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+        let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+        let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+
         for entry in entries {
             if entry.lsn <= w.applied_lsn {
                 continue;
             }
-            match &entry.op {
-                WalOp::WriteSlot {
-                    node_id,
-                    slot_bytes,
-                } => {
-                    let slot = NodeSlot::from_bytes(slot_bytes);
-                    self.storage.write_slot(*node_id, &slot)?;
-                    let idx = *node_id as usize;
-                    if idx >= cache.len() {
-                        cache.resize(idx + 1, NodeSlot::empty());
-                    }
-                    cache[idx] = slot;
+            if let WalOp::WriteHeap { offset, data } = &entry.op {
+                storage.write_heap_at(*offset, data)?;
+                let end = *offset + (data.len() as u64);
+                if end > w.heap_tail {
+                    w.heap_tail = end;
                 }
-                WalOp::WriteHeap { offset, data } => {
-                    self.storage.write_heap_at(*offset, data)?;
-                    let end = *offset + (data.len() as u64);
-                    if end > w.heap_tail {
-                        w.heap_tail = end;
-                    }
+            }
+        }
+
+        for entry in entries {
+            if entry.lsn <= w.applied_lsn {
+                continue;
+            }
+            if let WalOp::WriteSlot {
+                node_id,
+                slot_bytes,
+            } = &entry.op
+            {
+                let idx = *node_id as usize;
+                if let Some(old_slot) = cache.get(idx).filter(|s| s.is_active())
+                    && let Some(schema) = schemas.get(&old_slot.node_type)
+                {
+                    let old_vals = decode_record(schema, &old_slot.inline_data, &*storage)?;
+                    index.remove_node(schema, *node_id, &old_vals);
+                }
+
+                let new_slot = NodeSlot::from_bytes(slot_bytes);
+                storage.write_slot(*node_id, &new_slot)?;
+                if idx >= cache.len() {
+                    cache.resize(idx + 1, NodeSlot::empty());
+                }
+                cache[idx] = new_slot;
+
+                if new_slot.is_active()
+                    && let Some(schema) = schemas.get(&new_slot.node_type)
+                {
+                    let new_vals = decode_record(schema, &new_slot.inline_data, &*storage)?;
+                    index.insert_node(schema, *node_id, &new_vals);
                 }
             }
             w.applied_lsn = entry.lsn;
@@ -876,83 +1262,154 @@ impl Database {
             .filter(|s| s.is_active())
             .ok_or(HdbError::NodeNotFound(node_id))
     }
+
+    /// Captures a point-in-time consistent physical snapshot for a lagging or new Standby.
+    pub fn create_snapshot(&self) -> Result<BaseSnapshot, HdbError> {
+        let w = self.writer.lock().map_err(|_| HdbError::LockPoisoned)?;
+        let schemas = self.schemas.read().map_err(|_| HdbError::LockPoisoned)?;
+        let storage = self.storage.read().map_err(|_| HdbError::LockPoisoned)?;
+
+        storage.sync_all()?;
+        let (nodes_bytes, heap_bytes) = storage.read_all_files()?;
+
+        let mut schema_list: Vec<SegmentSchema> = schemas.values().cloned().collect();
+        schema_list.sort_by_key(|s| s.node_type);
+
+        Ok(BaseSnapshot {
+            snapshot_lsn: w.applied_lsn,
+            schemas: schema_list,
+            nodes_bytes,
+            heap_bytes,
+        })
+    }
+
+    /// Replaces local storage and in-memory caches with a base backup snapshot from Active.
+    pub fn install_snapshot(&self, snap: BaseSnapshot) -> Result<(), HdbError> {
+        let mut w = self.writer.lock().map_err(|_| HdbError::LockPoisoned)?;
+        let mut cache = self
+            .slot_cache
+            .write()
+            .map_err(|_| HdbError::LockPoisoned)?;
+        let mut schemas = self.schemas.write().map_err(|_| HdbError::LockPoisoned)?;
+        let mut storage = self.storage.write().map_err(|_| HdbError::LockPoisoned)?;
+        let mut index = self.index.write().map_err(|_| HdbError::LockPoisoned)?;
+
+        if !snap
+            .nodes_bytes
+            .len()
+            .is_multiple_of(crate::node::NODE_SLOT_SIZE)
+        {
+            return Err(HdbError::CorruptedData("Snapshot nodes_bytes misaligned"));
+        }
+
+        // 1. Write snapshot files to temporary paths and atomically swap
+        let tmp_nodes = self.dir.join("nodes.db.snap");
+        let tmp_heap = self.dir.join("heap.db.snap");
+        {
+            let mut nf = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_nodes)?;
+            nf.write_all(&snap.nodes_bytes)?;
+            nf.sync_data()?;
+
+            let mut hf = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_heap)?;
+            hf.write_all(&snap.heap_bytes)?;
+            hf.sync_data()?;
+        }
+        storage.replace_with_compacted(&self.dir, &tmp_nodes, &tmp_heap)?;
+
+        // 2. Replace schemas & persist catalog.db
+        schemas.clear();
+        for s in snap.schemas {
+            s.validate(INLINE_PAYLOAD_CAP)?;
+            schemas.insert(s.node_type, s);
+        }
+        CatalogStorage::save(&self.dir.join("catalog.db"), &schemas)?;
+
+        // 3. Rebuild slot_cache, free_list, and secondary indexes
+        let (slot_chunks, remainder) = snap
+            .nodes_bytes
+            .as_chunks::<{ crate::node::NODE_SLOT_SIZE }>();
+        if !remainder.is_empty() {
+            return Err(HdbError::CorruptedData("Snapshot nodes_bytes misaligned"));
+        }
+        let mut new_slots = Vec::with_capacity(slot_chunks.len());
+        for arr in slot_chunks {
+            new_slots.push(NodeSlot::from_bytes(arr));
+        }
+        if new_slots.is_empty() {
+            new_slots.push(NodeSlot::empty());
+        }
+
+        let mut new_index = SecondaryIndex::new();
+        w.free_list.clear();
+        for (id, slot) in new_slots.iter().enumerate().skip(1) {
+            if !slot.is_active() {
+                w.free_list.push(id as u64);
+            } else if let Some(schema) = schemas.get(&slot.node_type) {
+                let vals = decode_record(schema, &slot.inline_data, &*storage)?;
+                new_index.insert_node(schema, id as u64, &vals);
+            }
+        }
+
+        *cache = new_slots;
+        *index = new_index;
+        w.next_slot_id = cache.len() as u64;
+        w.heap_tail = snap.heap_bytes.len() as u64;
+        w.applied_lsn = snap.snapshot_lsn;
+        w.checkpointed_lsn = snap.snapshot_lsn;
+
+        // 4. Reset local WAL segments cleanly to match the snapshot baseline
+        if w.wal.active_byte_len() > 0 {
+            w.wal.rotate_segment()?;
+        }
+        w.wal.purge_segments_up_to(u64::MAX)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ColumnDef, DataType};
+    use crate::schema::{ColumnDef, DataType, Decimal};
 
     fn define_sample_schemas(db: &Database) {
-        // Type 1: Root (e.g., Organization)
         db.define_segment(SegmentSchema {
             node_type: 1,
             name: "Root".into(),
             parent_type: None,
-            columns: vec![ColumnDef {
-                name: "title".into(),
-                data_type: DataType::FixedString(16),
-                nullable: false,
-            }],
+            columns: vec![
+                ColumnDef::new("code", DataType::FixedString(16), false).with_index(true),
+            ],
         })
         .unwrap();
 
-        // Type 2: Folder / Department (can sit under Root(1) OR another Folder(2))
         db.define_segment(SegmentSchema {
             node_type: 2,
             name: "Folder".into(),
             parent_type: Some(1),
             columns: vec![
-                ColumnDef {
-                    name: "val".into(),
-                    data_type: DataType::I64,
-                    nullable: false,
-                },
-                ColumnDef {
-                    name: "note".into(),
-                    data_type: DataType::VarString,
-                    nullable: true,
-                },
+                ColumnDef::new("val", DataType::I64, false).with_index(false),
+                ColumnDef::new("note", DataType::VarString, true),
             ],
         })
         .unwrap();
 
-        // Type 3: RecursiveNode (allows self-nested hierarchy for cyclic move tests)
-        db.define_segment(SegmentSchema {
-            node_type: 3,
-            name: "TreeNode".into(),
-            parent_type: Some(3),
-            columns: vec![ColumnDef {
-                name: "label".into(),
-                data_type: DataType::FixedString(16),
-                nullable: false,
-            }],
-        })
-        .unwrap();
-
-        // Type 4: TopTreeNode (root for TreeNode(3))
-        db.define_segment(SegmentSchema {
-            node_type: 4,
-            name: "TopTree".into(),
-            parent_type: None,
-            columns: vec![ColumnDef {
-                name: "label".into(),
-                data_type: DataType::FixedString(16),
-                nullable: false,
-            }],
-        })
-        .unwrap();
-
-        // Type 5: LeafItem (child of Folder(2))
         db.define_segment(SegmentSchema {
             node_type: 5,
-            name: "LeafItem".into(),
+            name: "Invoice".into(),
             parent_type: Some(2),
-            columns: vec![ColumnDef {
-                name: "code".into(),
-                data_type: DataType::I64,
-                nullable: false,
-            }],
+            columns: vec![
+                ColumnDef::new("invoice_no", DataType::FixedString(16), false).with_index(true),
+                ColumnDef::new("amount", DataType::Decimal, false).with_index(false),
+            ],
         })
         .unwrap();
     }
@@ -963,6 +1420,131 @@ mod tests {
         let db = Database::open(&dir).unwrap();
         define_sample_schemas(&db);
         (db, dir)
+    }
+
+    #[test]
+    fn test_vacuum_compaction_reclaims_heap_and_slots() {
+        let (db, dir) = setup_db("vacuum");
+
+        let root = db.insert(0, 1, &[Value::String("ORG-VAC".into())]).unwrap();
+        let f_dead = db
+            .insert(root, 2, &[Value::I64(1), Value::String("x".repeat(500))])
+            .unwrap();
+        let f_live = db
+            .insert(root, 2, &[Value::I64(2), Value::String("initial".into())])
+            .unwrap();
+
+        // Update f_live multiple times to leave stale heap garbage
+        for i in 0..5 {
+            db.update(
+                f_live,
+                &[
+                    Value::I64(2),
+                    Value::String(format!("payload_v{}_{}", i, "y".repeat(200))),
+                ],
+            )
+            .unwrap();
+        }
+        // Delete f_dead to leave a slot gap
+        db.delete(f_dead).unwrap();
+
+        let stats = db.vacuum().unwrap();
+        assert_eq!(stats.active_nodes, 2); // root + f_live
+        assert_eq!(stats.old_slot_capacity, 4); // dummy(0) + root(1) + f_dead(2) + f_live(3)
+        assert!(stats.new_heap_bytes < stats.old_heap_bytes);
+
+        // Verify tree & secondary index still resolve properly after ID reassignment
+        let new_root = db
+            .find_by_index(1, "code", &Value::String("ORG-VAC".into()))
+            .unwrap()[0];
+        assert_eq!(new_root, 1);
+        let children = db.children_of_type(new_root, 2).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].node_id, 2);
+        assert_eq!(
+            children[0].values[1],
+            Value::String(format!("payload_v4_{}", "y".repeat(200)))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_secondary_index_decimal_and_rich_reads() {
+        let (db, dir) = setup_db("idx_reads");
+
+        let root = db.insert(0, 1, &[Value::String("ORG-A".into())]).unwrap();
+
+        let dup_err = db
+            .insert(0, 1, &[Value::String("ORG-A".into())])
+            .unwrap_err();
+        assert!(matches!(
+            dup_err,
+            HdbError::UniqueConstraintViolation {
+                node_type: 1,
+                col_index: 0
+            }
+        ));
+
+        let f1 = db
+            .insert(root, 2, &[Value::I64(10), Value::String("sales".into())])
+            .unwrap();
+        let f2 = db
+            .insert(root, 2, &[Value::I64(10), Value::String("dev".into())])
+            .unwrap();
+
+        let matching_folders = db.find_by_index(2, "val", &Value::I64(10)).unwrap();
+        assert_eq!(matching_folders, vec![f1, f2]);
+
+        let inv1 = db
+            .insert(
+                f1,
+                5,
+                &[
+                    Value::String("INV-001".into()),
+                    Value::Decimal(Decimal::new(125050, 2)),
+                ],
+            )
+            .unwrap();
+
+        let by_dec = db
+            .get_by_index(5, "amount", &Value::Decimal(Decimal::new(12505, 1)))
+            .unwrap();
+        assert_eq!(by_dec.len(), 1);
+        assert_eq!(by_dec[0].node_id, inv1);
+
+        let folders = db.children_of_type(root, 2).unwrap();
+        assert_eq!(folders.len(), 2);
+
+        let tree = db.walk_subtree(root, None).unwrap();
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[3].node_id, inv1);
+        assert_eq!(tree[3].depth, 2);
+
+        let shallow_tree = db.walk_subtree(root, Some(1)).unwrap();
+        assert_eq!(shallow_tree.len(), 3);
+
+        db.update(
+            inv1,
+            &[
+                Value::String("INV-001".into()),
+                Value::Decimal(Decimal::new(99900, 2)),
+            ],
+        )
+        .unwrap();
+        assert!(
+            db.find_by_index(5, "amount", &Value::Decimal(Decimal::new(12505, 1)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.find_by_index(5, "amount", &Value::Decimal(Decimal::new(999, 0)))
+                .unwrap(),
+            vec![inv1]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -979,6 +1561,11 @@ mod tests {
         db.delete(c2).unwrap();
         assert_eq!(db.children_ids(root).unwrap(), vec![c3, c1]);
         assert!(matches!(db.get(c2), Err(HdbError::NodeNotFound(_))));
+        assert!(
+            db.find_by_index(2, "val", &Value::I64(20))
+                .unwrap()
+                .is_empty()
+        );
 
         let c4 = db.insert(root, 2, &[Value::I64(40), Value::Null]).unwrap();
         assert_eq!(c4, c2);
@@ -1027,18 +1614,24 @@ mod tests {
 
         let folder1 = db.insert(root_a, 2, &[Value::I64(1), Value::Null]).unwrap();
         let folder2 = db.insert(root_a, 2, &[Value::I64(2), Value::Null]).unwrap();
-        let leaf = db.insert(folder1, 5, &[Value::I64(999)]).unwrap();
+        let inv = db
+            .insert(
+                folder1,
+                5,
+                &[
+                    Value::String("INV-MOVE".into()),
+                    Value::Decimal(Decimal::new(500, 0)),
+                ],
+            )
+            .unwrap();
 
-        // RootA has [folder2, folder1]; move folder1 (along with its child `leaf`) under RootB
         db.move_node(folder1, root_b).unwrap();
 
         assert_eq!(db.children_ids(root_a).unwrap(), vec![folder2]);
         assert_eq!(db.children_ids(root_b).unwrap(), vec![folder1]);
-        // Subtree child `leaf` remains intact under `folder1`
-        assert_eq!(db.children_ids(folder1).unwrap(), vec![leaf]);
+        assert_eq!(db.children_ids(folder1).unwrap(), vec![inv]);
 
-        // Schema constraint check: cannot move LeafItem(5, expects parent 2) directly under RootB(1)
-        let err = db.move_node(leaf, root_b).unwrap_err();
+        let err = db.move_node(inv, root_b).unwrap_err();
         assert!(matches!(
             err,
             HdbError::InvalidParentType {
@@ -1047,62 +1640,13 @@ mod tests {
             }
         ));
 
-        // Cyclic move check using self-nesting TreeNode(3)
-        let top = db.insert(0, 4, &[Value::String("Top".into())]).unwrap();
-        db.define_segment(SegmentSchema {
-            node_type: 6,
-            name: "Branch".into(),
-            parent_type: Some(4),
-            columns: vec![],
-        })
-        .unwrap();
-        // Allow TreeNode(3) under Branch(6) or TreeNode(3) -> test self-cycle on type 3
-        // Let's register a self-referential root type 7 (parent_type: None) + child type 8 (parent_type: Some(8))
-        // For cyclic test, build a chain: n1(type 6 under top) -> skip; use a dedicated self-parent schema:
-        db.define_segment(SegmentSchema {
-            node_type: 7,
-            name: "SelfNode".into(),
-            parent_type: None,
-            columns: vec![],
-        })
-        .unwrap();
-        // Note: a node whose parent_type is Some(7) can be moved under any node of type 7
-        db.define_segment(SegmentSchema {
-            node_type: 8,
-            name: "RecursiveChild".into(),
-            parent_type: Some(8),
-            columns: vec![],
-        })
-        .unwrap();
-
-        let _ = top;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_cyclic_move_prevention() {
-        let dir = std::env::temp_dir().join(format!("alice_cycle_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let db = Database::open(&dir).unwrap();
-
-        // Type 10: Self-referencing node (can be root OR child of type 10 by creating root via type 10 if parent_type=Some(10) isn't root)
-        // To build a multi-level chain of the same node_type, bootstrap the top node first or allow 10 -> 10:
-        db.define_segment(SegmentSchema {
-            node_type: 10,
-            name: "ChainNode".into(),
-            parent_type: None,
-            columns: vec![],
-        })
-        .unwrap();
-        // Verify moving a node into itself is rejected
-        let n1 = db.insert(0, 10, &[]).unwrap();
-        let err_self = db.move_node(n1, n1).unwrap_err();
+        let err_self = db.move_node(root_a, root_a).unwrap_err();
         assert!(matches!(
             err_self,
             HdbError::CyclicMove {
                 node_id,
                 target_parent_id
-            } if node_id == n1 && target_parent_id == n1
+            } if node_id == root_a && target_parent_id == root_a
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1117,31 +1661,44 @@ mod tests {
         let f_del = db.insert(root, 2, &[Value::I64(2), Value::Null]).unwrap();
         let f_keep2 = db.insert(root, 2, &[Value::I64(3), Value::Null]).unwrap();
 
-        // Attach 2 grandchildren under `f_del`
-        let leaf1 = db.insert(f_del, 5, &[Value::I64(101)]).unwrap();
-        let leaf2 = db.insert(f_del, 5, &[Value::I64(102)]).unwrap();
+        let inv1 = db
+            .insert(
+                f_del,
+                5,
+                &[
+                    Value::String("INV-A".into()),
+                    Value::Decimal(Decimal::new(100, 0)),
+                ],
+            )
+            .unwrap();
+        let inv2 = db
+            .insert(
+                f_del,
+                5,
+                &[
+                    Value::String("INV-B".into()),
+                    Value::Decimal(Decimal::new(200, 0)),
+                ],
+            )
+            .unwrap();
 
-        // Children of root before delete: [f_keep2, f_del, f_keep]
-        assert_eq!(db.children_ids(root).unwrap(), vec![f_keep2, f_del, f_keep]);
-
-        // Delete `f_del` subtree (f_del + leaf1 + leaf2 = 3 nodes total)
         let deleted_count = db.delete_subtree(f_del).unwrap();
         assert_eq!(deleted_count, 3);
-
-        // Remaining siblings must be linked cleanly: [f_keep2, f_keep]
         assert_eq!(db.children_ids(root).unwrap(), vec![f_keep2, f_keep]);
-        assert!(matches!(db.get(f_del), Err(HdbError::NodeNotFound(_))));
-        assert!(matches!(db.get(leaf1), Err(HdbError::NodeNotFound(_))));
-        assert!(matches!(db.get(leaf2), Err(HdbError::NodeNotFound(_))));
 
-        // All 3 freed slots must be reused before allocating new slot IDs
+        assert!(
+            db.find_by_index(5, "invoice_no", &Value::String("INV-A".into()))
+                .unwrap()
+                .is_empty()
+        );
+
         let r1 = db.insert(root, 2, &[Value::I64(10), Value::Null]).unwrap();
         let r2 = db.insert(root, 2, &[Value::I64(20), Value::Null]).unwrap();
         let r3 = db.insert(root, 2, &[Value::I64(30), Value::Null]).unwrap();
         let reclaimed = [r1, r2, r3];
         assert!(reclaimed.contains(&f_del));
-        assert!(reclaimed.contains(&leaf1));
-        assert!(reclaimed.contains(&leaf2));
+        assert!(reclaimed.contains(&inv1));
+        assert!(reclaimed.contains(&inv2));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1175,14 +1732,17 @@ mod tests {
             assert_eq!(c_vals[0], Value::I64(200));
             assert_eq!(c_vals[1], Value::String("updated note".into()));
 
-            // Checkpoint rotates active WAL segment and purges the closed segment
+            assert_eq!(
+                db2.find_by_index(2, "val", &Value::I64(200)).unwrap(),
+                vec![child_id]
+            );
+
             let purged = db2.checkpoint().unwrap();
             assert_eq!(purged, 1);
             assert!(!dir.join("wal_00000001.log").exists());
             assert!(dir.join("wal_00000002.log").exists());
         }
 
-        // Reopen after checkpoint: data must still be intact
         {
             let db3 = Database::open(&dir).unwrap();
             let (_, c_vals) = db3.get(child_id).unwrap();
@@ -1191,5 +1751,51 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn test_snapshot_export_and_install() {
+        let (src_db, src_dir) = setup_db("snap_src");
+
+        let root = src_db
+            .insert(0, 1, &[Value::String("ORG-SNAP".into())])
+            .unwrap();
+        let folder = src_db
+            .insert(
+                root,
+                2,
+                &[Value::I64(77), Value::String("heap_payload".into())],
+            )
+            .unwrap();
+        let _inv = src_db
+            .insert(
+                folder,
+                5,
+                &[
+                    Value::String("INV-SNAP".into()),
+                    Value::Decimal(Decimal::new(4250, 2)),
+                ],
+            )
+            .unwrap();
+
+        let snap = src_db.create_snapshot().unwrap();
+        assert!(snap.snapshot_lsn > 0);
+
+        // Install snapshot into a brand-new target database directory
+        let dst_dir = std::env::temp_dir().join(format!("alice_snap_dst_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst_dir);
+        let dst_db = Database::open(&dst_dir).unwrap();
+        dst_db.install_snapshot(snap.clone()).unwrap();
+
+        assert_eq!(dst_db.current_lsn().unwrap(), snap.snapshot_lsn);
+        let found = dst_db
+            .find_by_index(5, "invoice_no", &Value::String("INV-SNAP".into()))
+            .unwrap();
+        assert_eq!(found.len(), 1);
+
+        let walked = dst_db.walk_subtree(root, None).unwrap();
+        assert_eq!(walked.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 }

@@ -2,6 +2,32 @@ use crate::error::HdbError;
 
 pub const MAX_COLUMNS: usize = 64; // Fits within a single 64-bit null bitmap
 
+/// Exact 128-bit base-10 decimal representation: `unscaled * 10^(-scale)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Decimal {
+    pub unscaled: i128,
+    pub scale: u8,
+}
+
+impl Decimal {
+    pub fn new(unscaled: i128, scale: u8) -> Self {
+        Self { unscaled, scale }
+    }
+
+    /// Normalizes trailing base-10 zeros so equivalent values (e.g., 1.50 and 1.5) share the same key.
+    pub fn normalize(mut self) -> Self {
+        if self.unscaled == 0 {
+            self.scale = 0;
+            return self;
+        }
+        while self.scale > 0 && self.unscaled % 10 == 0 {
+            self.unscaled /= 10;
+            self.scale -= 1;
+        }
+        self
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -12,6 +38,7 @@ pub enum DataType {
     FixedBytes(u16) = 5,
     VarString = 6,
     VarBytes = 7,
+    Decimal = 8,
 }
 
 impl DataType {
@@ -24,6 +51,7 @@ impl DataType {
             DataType::FixedBytes(_) => 5,
             DataType::VarString => 6,
             DataType::VarBytes => 7,
+            DataType::Decimal => 8,
         }
     }
 
@@ -43,7 +71,8 @@ impl DataType {
             5 => Ok(DataType::FixedBytes(param)),
             6 => Ok(DataType::VarString),
             7 => Ok(DataType::VarBytes),
-            _ => Err(HdbError::CorruptedData("Unknown DataType tag in catalog")),
+            8 => Ok(DataType::Decimal),
+            _ => Err(HdbError::CorruptedData("Unknown DataType tag")),
         }
     }
 
@@ -55,6 +84,7 @@ impl DataType {
             DataType::FixedString(n) => 2 + (*n as usize),
             DataType::FixedBytes(n) => *n as usize,
             DataType::VarString | DataType::VarBytes => 12,
+            DataType::Decimal => 17, // 1B scale + 16B i128
         }
     }
 }
@@ -64,6 +94,26 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub indexed: bool,
+    pub unique: bool,
+}
+
+impl ColumnDef {
+    pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            nullable,
+            indexed: false,
+            unique: false,
+        }
+    }
+
+    pub fn with_index(mut self, unique: bool) -> Self {
+        self.indexed = true;
+        self.unique = unique;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,10 +125,15 @@ pub struct SegmentSchema {
 }
 
 impl SegmentSchema {
-    /// Validates that column count and inline byte size fit within NodeSlot limits.
+    /// Validates column count, indexable types, and inline payload capacity.
     pub fn validate(&self, max_inline_cap: usize) -> Result<(), HdbError> {
         if self.columns.len() > MAX_COLUMNS {
             return Err(HdbError::TooManyColumns(self.columns.len()));
+        }
+        for (i, col) in self.columns.iter().enumerate() {
+            if (col.indexed || col.unique) && matches!(col.data_type, DataType::F64) {
+                return Err(HdbError::UnsupportedIndexType { col_index: i });
+            }
         }
         let required: usize = 8 + self
             .columns
@@ -93,6 +148,13 @@ impl SegmentSchema {
         }
         Ok(())
     }
+
+    pub fn find_column(&self, name: &str) -> Option<(usize, &ColumnDef)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,4 +165,5 @@ pub enum Value {
     F64(f64),
     String(String),
     Bytes(Vec<u8>),
+    Decimal(Decimal),
 }

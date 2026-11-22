@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod db;
 pub mod error;
+pub mod index;
 pub mod node;
 pub mod record;
 pub mod schema;

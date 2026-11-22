@@ -33,6 +33,15 @@ pub enum HdbError {
     InvalidUtf8,
     NodeNotFound(u64),
     HasChildren(u64),
+    ColumnNotFound(String),
+    ColumnNotIndexed(String),
+    UnsupportedIndexType {
+        col_index: usize,
+    },
+    UniqueConstraintViolation {
+        node_type: u16,
+        col_index: usize,
+    },
     ReadOnlyReplica,
     ReplicationLag {
         requested_lsn: u64,

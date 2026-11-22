@@ -24,7 +24,10 @@ impl CatalogStorage {
             return Err(HdbError::CorruptedData("Invalid catalog file header"));
         }
 
-        let schema_count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let count_arr: [u8; 4] = buf[8..12]
+            .try_into()
+            .map_err(|_| HdbError::CorruptedData("Invalid catalog schema count"))?;
+        let schema_count = u32::from_le_bytes(count_arr) as usize;
         let mut cursor = 12;
         let mut schemas = HashMap::with_capacity(schema_count);
 
@@ -42,13 +45,18 @@ impl CatalogStorage {
                 let col_name = Self::read_string(&buf, &mut cursor)?;
                 let tag = Self::read_u8(&buf, &mut cursor)?;
                 let param = Self::read_u16(&buf, &mut cursor)?;
-                let nullable = Self::read_u8(&buf, &mut cursor)? != 0;
+                let flags = Self::read_u8(&buf, &mut cursor)?;
+                let nullable = (flags & (1 << 0)) != 0;
+                let indexed = (flags & (1 << 1)) != 0;
+                let unique = (flags & (1 << 2)) != 0;
                 let data_type = DataType::from_raw(tag, param)?;
 
                 columns.push(ColumnDef {
                     name: col_name,
                     data_type,
                     nullable,
+                    indexed,
+                    unique,
                 });
             }
 
@@ -71,7 +79,6 @@ impl CatalogStorage {
         buf.extend_from_slice(CATALOG_MAGIC);
         buf.extend_from_slice(&(schemas.len() as u32).to_le_bytes());
 
-        // Sort keys for deterministic binary output
         let mut keys: Vec<u16> = schemas.keys().copied().collect();
         keys.sort_unstable();
 
@@ -95,11 +102,20 @@ impl CatalogStorage {
                 Self::write_string(&mut buf, &col.name);
                 buf.push(col.data_type.type_tag());
                 buf.extend_from_slice(&col.data_type.type_param().to_le_bytes());
-                buf.push(if col.nullable { 1 } else { 0 });
+                let mut flags = 0u8;
+                if col.nullable {
+                    flags |= 1 << 0;
+                }
+                if col.indexed {
+                    flags |= 1 << 1;
+                }
+                if col.unique {
+                    flags |= 1 << 2;
+                }
+                buf.push(flags);
             }
         }
 
-        // Write to temp file, fsync, then atomically rename over catalog.db
         let tmp_path = path.with_extension("db.tmp");
         {
             let mut tmp_file = OpenOptions::new()
@@ -133,9 +149,11 @@ impl CatalogStorage {
         if *cursor + 2 > buf.len() {
             return Err(HdbError::CorruptedData("Unexpected EOF in catalog"));
         }
-        let v = u16::from_le_bytes(buf[*cursor..*cursor + 2].try_into().unwrap());
+        let arr: [u8; 2] = buf[*cursor..*cursor + 2]
+            .try_into()
+            .map_err(|_| HdbError::CorruptedData("Invalid u16 slice in catalog"))?;
         *cursor += 2;
-        Ok(v)
+        Ok(u16::from_le_bytes(arr))
     }
 
     fn read_string(buf: &[u8], cursor: &mut usize) -> Result<String, HdbError> {
@@ -168,16 +186,9 @@ mod tests {
                 name: "Company".into(),
                 parent_type: None,
                 columns: vec![
-                    ColumnDef {
-                        name: "code".into(),
-                        data_type: DataType::FixedString(8),
-                        nullable: false,
-                    },
-                    ColumnDef {
-                        name: "hash".into(),
-                        data_type: DataType::FixedBytes(32),
-                        nullable: true,
-                    },
+                    ColumnDef::new("code", DataType::FixedString(8), false).with_index(true),
+                    ColumnDef::new("hash", DataType::FixedBytes(32), true).with_index(false),
+                    ColumnDef::new("balance", DataType::Decimal, false),
                 ],
             },
         );

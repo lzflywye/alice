@@ -1,3 +1,6 @@
+use crate::auth::{
+    AuthRegistry, build_auth_message, compute_client_proof, generate_nonce, verify_client_proof,
+};
 use crate::protocol::{
     Request, Response, decode_request, decode_response, encode_request, encode_response,
     read_frame, write_frame,
@@ -10,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-/// Simple synchronous TCP client for Alice Hierarchical Database.
+/// Synchronous TCP client supporting unauthenticated and SCRAM-SHA-256 authenticated sessions.
 pub struct AliceClient {
     stream: TcpStream,
 }
@@ -22,6 +25,63 @@ impl AliceClient {
         Ok(Self { stream })
     }
 
+    pub fn connect_with_auth<A: ToSocketAddrs>(
+        addr: A,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, HdbError> {
+        let mut client = Self::connect(addr)?;
+        client.authenticate(username, password)?;
+        Ok(client)
+    }
+
+    /// Performs mutual SCRAM-SHA-256 authentication with the server.
+    pub fn authenticate(&mut self, username: &str, password: &str) -> Result<(), HdbError> {
+        let client_nonce = generate_nonce()?;
+        let resp = self.call(Request::AuthHello {
+            username: username.to_string(),
+            client_nonce: client_nonce.to_vec(),
+        })?;
+
+        let (salt, iterations, combined_nonce) = match resp {
+            Response::AuthChallenge {
+                salt,
+                iterations,
+                combined_nonce,
+            } => (salt, iterations, combined_nonce),
+            Response::Err(_) => return Err(HdbError::CorruptedData("Authentication rejected")),
+            _ => return Err(HdbError::CorruptedData("Unexpected response to AuthHello")),
+        };
+
+        // Ensure server echoed back our exact client_nonce prefix
+        if !combined_nonce.starts_with(&client_nonce) || combined_nonce.len() <= client_nonce.len()
+        {
+            return Err(HdbError::CorruptedData(
+                "Invalid combined nonce from server",
+            ));
+        }
+
+        let auth_msg = build_auth_message(username, &combined_nonce, &salt);
+        let (client_proof, expected_server_sig) =
+            compute_client_proof(password, &salt, iterations, &auth_msg)?;
+
+        match self.call(Request::AuthProof { client_proof })? {
+            Response::AuthSuccess { server_signature } => {
+                // Constant-time verification of server signature (mutual authentication)
+                let mut diff: u8 = 0;
+                for (a, b) in server_signature.iter().zip(expected_server_sig.iter()) {
+                    diff |= a ^ b;
+                }
+                if diff != 0 {
+                    return Err(HdbError::CorruptedData("Server signature mismatch"));
+                }
+                Ok(())
+            }
+            Response::Err(_) => Err(HdbError::CorruptedData("Invalid credentials")),
+            _ => Err(HdbError::CorruptedData("Unexpected response to AuthProof")),
+        }
+    }
+
     pub fn call(&mut self, req: Request) -> Result<Response, HdbError> {
         let (tag, body) = encode_request(&req);
         write_frame(&mut self.stream, tag, &body)?;
@@ -30,9 +90,10 @@ impl AliceClient {
     }
 }
 
-/// TCP Server wrapper around `Database` supporting both Active and Standby modes.
+/// TCP Server wrapper around `Database` supporting Active/Standby modes and SCRAM-SHA-256 auth.
 pub struct AliceServer {
     db: Arc<Database>,
+    auth: Arc<AuthRegistry>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -40,15 +101,27 @@ impl AliceServer {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
+            auth: Arc::new(AuthRegistry::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_auth(db: Arc<Database>, auth: Arc<AuthRegistry>) -> Self {
+        Self {
+            db,
+            auth,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn auth_registry(&self) -> Arc<AuthRegistry> {
+        Arc::clone(&self.auth)
     }
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Starts accepting client & replication connections in background threads.
     pub fn start_listener<A: ToSocketAddrs>(
         &self,
         bind_addr: A,
@@ -58,6 +131,7 @@ impl AliceServer {
         let local_addr = listener.local_addr()?;
 
         let db = Arc::clone(&self.db);
+        let auth = Arc::clone(&self.auth);
         let shutdown = Arc::clone(&self.shutdown);
 
         thread::spawn(move || {
@@ -65,9 +139,10 @@ impl AliceServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let db_conn = Arc::clone(&db);
+                        let auth_conn = Arc::clone(&auth);
                         let shutdown_conn = Arc::clone(&shutdown);
                         thread::spawn(move || {
-                            let _ = handle_connection(stream, db_conn, shutdown_conn);
+                            let _ = handle_connection(stream, db_conn, auth_conn, shutdown_conn);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -81,8 +156,18 @@ impl AliceServer {
         Ok(local_addr)
     }
 
-    /// Starts background WAL replication loop pulling changes from an Active primary.
     pub fn start_standby_replication(&self, primary_addr: String, poll_interval: Duration) {
+        self.start_standby_replication_with_auth(primary_addr, poll_interval, None);
+    }
+
+    /// Starts background WAL replication loop pulling changes (with optional SCRAM credentials
+    /// and automatic snapshot fallback).
+    pub fn start_standby_replication_with_auth(
+        &self,
+        primary_addr: String,
+        poll_interval: Duration,
+        credentials: Option<(String, String)>,
+    ) {
         if self.db.set_replica_mode(true).is_err() {
             return;
         }
@@ -93,10 +178,15 @@ impl AliceServer {
             let mut client: Option<AliceClient> = None;
 
             while !shutdown.load(Ordering::SeqCst) {
-                // Establish or reconnect to primary
                 if client.is_none() {
-                    if let Ok(mut c) = AliceClient::connect(&primary_addr) {
-                        // Sync segment schemas first
+                    let conn_res = match &credentials {
+                        Some((user, pass)) => {
+                            AliceClient::connect_with_auth(&primary_addr, user, pass)
+                        }
+                        None => AliceClient::connect(&primary_addr),
+                    };
+
+                    if let Ok(mut c) = conn_res {
                         if let Ok(Response::OkCatalog(schemas)) = c.call(Request::SyncCatalog) {
                             let _ = db.import_schemas(schemas);
                             client = Some(c);
@@ -107,15 +197,26 @@ impl AliceServer {
                     }
                 }
 
-                if let Some(ref mut c) = client
-                    && let Ok(after_lsn) = db.current_lsn()
-                {
+                if let Some(ref mut c) = client {
+                    let Ok(after_lsn) = db.current_lsn() else {
+                        break;
+                    };
                     match c.call(Request::FetchWal { after_lsn }) {
                         Ok(Response::OkWalBatch(entries)) => {
                             if !entries.is_empty() {
+                                if let Ok(Response::OkCatalog(schemas)) =
+                                    c.call(Request::SyncCatalog)
+                                {
+                                    let _ = db.import_schemas(schemas);
+                                }
                                 let _ = db.apply_replicated_entries(&entries);
                             } else {
                                 thread::sleep(poll_interval);
+                            }
+                        }
+                        Ok(Response::Err(msg)) if msg.contains("ReplicationLag") => {
+                            if let Ok(Response::OkSnapshot(snap)) = c.call(Request::FetchSnapshot) {
+                                let _ = db.install_snapshot(snap);
                             }
                         }
                         _ => {
@@ -132,10 +233,16 @@ impl AliceServer {
 fn handle_connection(
     mut stream: TcpStream,
     db: Arc<Database>,
+    auth: Arc<AuthRegistry>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), HdbError> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+
+    let auth_required = auth.is_enabled().unwrap_or(true);
+    if auth_required && !perform_server_handshake(&mut stream, &auth, &shutdown)? {
+        return Ok(());
+    }
 
     while !shutdown.load(Ordering::SeqCst) {
         let (tag, body) = match read_frame(&mut stream) {
@@ -160,6 +267,100 @@ fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Runs the 2-step SCRAM-SHA-256 handshake before allowing any database RPCs.
+fn perform_server_handshake(
+    stream: &mut TcpStream,
+    auth: &AuthRegistry,
+    shutdown: &AtomicBool,
+) -> Result<bool, HdbError> {
+    // Step 1: Expect AuthHello
+    let (tag1, body1) = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match read_frame(stream) {
+            Ok(frame) => break frame,
+            Err(HdbError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return Ok(false),
+        }
+    };
+
+    let (username, client_nonce) = match decode_request(tag1, &body1) {
+        Ok(Request::AuthHello {
+            username,
+            client_nonce,
+        }) if !client_nonce.is_empty() => (username, client_nonce),
+        _ => {
+            let (t, b) = encode_response(&Response::Err("Authentication required".into()));
+            let _ = write_frame(stream, t, &b);
+            return Ok(false);
+        }
+    };
+
+    let Some(cred) = auth.get_user(&username)? else {
+        let (t, b) = encode_response(&Response::Err("Authentication failed".into()));
+        let _ = write_frame(stream, t, &b);
+        return Ok(false);
+    };
+
+    let server_nonce = generate_nonce()?;
+    let mut combined_nonce = Vec::with_capacity(client_nonce.len() + server_nonce.len());
+    combined_nonce.extend_from_slice(&client_nonce);
+    combined_nonce.extend_from_slice(&server_nonce);
+
+    let (ct, cb) = encode_response(&Response::AuthChallenge {
+        salt: cred.salt,
+        iterations: cred.iterations,
+        combined_nonce: combined_nonce.clone(),
+    });
+    write_frame(stream, ct, &cb)?;
+
+    // Step 2: Expect AuthProof
+    let (tag2, body2) = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match read_frame(stream) {
+            Ok(frame) => break frame,
+            Err(HdbError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return Ok(false),
+        }
+    };
+
+    let client_proof = match decode_request(tag2, &body2) {
+        Ok(Request::AuthProof { client_proof }) => client_proof,
+        _ => {
+            let (t, b) = encode_response(&Response::Err("Expected AuthProof".into()));
+            let _ = write_frame(stream, t, &b);
+            return Ok(false);
+        }
+    };
+
+    let auth_msg = build_auth_message(&username, &combined_nonce, &cred.salt);
+    match verify_client_proof(&cred, &auth_msg, &client_proof) {
+        Some(server_signature) => {
+            let (st, sb) = encode_response(&Response::AuthSuccess { server_signature });
+            write_frame(stream, st, &sb)?;
+            Ok(true)
+        }
+        None => {
+            let (et, eb) = encode_response(&Response::Err("Authentication failed".into()));
+            let _ = write_frame(stream, et, &eb);
+            Ok(false)
+        }
+    }
 }
 
 fn dispatch_request(db: &Database, req: Request) -> Response {
@@ -205,5 +406,31 @@ fn dispatch_request(db: &Database, req: Request) -> Response {
             Ok(()) => Response::OkEmpty,
             Err(e) => Response::Err(format!("{:?}", e)),
         },
+        Request::FetchSnapshot => match db.create_snapshot() {
+            Ok(snap) => Response::OkSnapshot(snap),
+            Err(e) => Response::Err(format!("{:?}", e)),
+        },
+        Request::FindByIndex {
+            node_type,
+            col_name,
+            value,
+        } => match db.find_by_index(node_type, &col_name, &value) {
+            Ok(ids) => Response::OkNodeIds(ids),
+            Err(e) => Response::Err(format!("{:?}", e)),
+        },
+        Request::WalkSubtree {
+            root_node_id,
+            max_depth,
+        } => match db.walk_subtree(root_node_id, max_depth) {
+            Ok(views) => Response::OkNodeViews(views),
+            Err(e) => Response::Err(format!("{:?}", e)),
+        },
+        Request::Vacuum => match db.vacuum() {
+            Ok(stats) => Response::OkVacuum(stats),
+            Err(e) => Response::Err(format!("{:?}", e)),
+        },
+        Request::AuthHello { .. } | Request::AuthProof { .. } => {
+            Response::Err("Already authenticated".into())
+        }
     }
 }
