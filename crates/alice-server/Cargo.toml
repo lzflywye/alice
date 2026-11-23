@@ -6,3 +6,5 @@ edition.workspace = true
 [dependencies]
 alice-core = { path = "../alice-core" }
 aws-lc-rs.workspace = true
+serde.workspace = true
+toml.workspace = true

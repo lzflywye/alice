@@ -51,15 +51,16 @@ impl SecondaryIndex {
                 continue;
             };
             if let Some(col_map) = self.entries.get(&(schema.node_type, col_idx))
-                && let Some(node_ids) = col_map.get(&key) {
-                    let conflict = node_ids.iter().any(|&id| Some(id) != exclude_node_id);
-                    if conflict {
-                        return Err(HdbError::UniqueConstraintViolation {
-                            node_type: schema.node_type,
-                            col_index: col_idx,
-                        });
-                    }
+                && let Some(node_ids) = col_map.get(&key)
+            {
+                let conflict = node_ids.iter().any(|&id| Some(id) != exclude_node_id);
+                if conflict {
+                    return Err(HdbError::UniqueConstraintViolation {
+                        node_type: schema.node_type,
+                        col_index: col_idx,
+                    });
                 }
+            }
         }
         Ok(())
     }
@@ -87,12 +88,13 @@ impl SecondaryIndex {
             }
             if let Some(key) = IndexKey::from_value(val)
                 && let Some(col_map) = self.entries.get_mut(&(schema.node_type, col_idx))
-                    && let Some(set) = col_map.get_mut(&key) {
-                        set.remove(&node_id);
-                        if set.is_empty() {
-                            col_map.remove(&key);
-                        }
-                    }
+                && let Some(set) = col_map.get_mut(&key)
+            {
+                set.remove(&node_id);
+                if set.is_empty() {
+                    col_map.remove(&key);
+                }
+            }
         }
     }
 

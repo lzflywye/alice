@@ -134,10 +134,12 @@ pub fn compute_client_proof(
     let client_sig = hmac::sign(&stored_hmac_key, auth_message);
 
     let mut proof = [0u8; SHA256_LEN];
-    for (p, (&ck, &cs)) in proof
-        .iter_mut()
-        .zip(client_key_tag.as_ref().iter().zip(client_sig.as_ref().iter()))
-    {
+    for (p, (&ck, &cs)) in proof.iter_mut().zip(
+        client_key_tag
+            .as_ref()
+            .iter()
+            .zip(client_sig.as_ref().iter()),
+    ) {
         *p = ck ^ cs;
     }
 

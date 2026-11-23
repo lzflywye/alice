@@ -1,6 +1,7 @@
 use crate::auth::{
     AuthRegistry, build_auth_message, compute_client_proof, generate_nonce, verify_client_proof,
 };
+use crate::config::ServerConfig;
 use crate::protocol::{
     Request, Response, decode_request, decode_response, encode_request, encode_response,
     read_frame, write_frame,
@@ -9,9 +10,19 @@ use alice_core::db::Database;
 use alice_core::error::HdbError;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
+
+struct ActiveConnGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Synchronous TCP client supporting unauthenticated and SCRAM-SHA-256 authenticated sessions.
 pub struct AliceClient {
@@ -53,7 +64,6 @@ impl AliceClient {
             _ => return Err(HdbError::CorruptedData("Unexpected response to AuthHello")),
         };
 
-        // Ensure server echoed back our exact client_nonce prefix
         if !combined_nonce.starts_with(&client_nonce) || combined_nonce.len() <= client_nonce.len()
         {
             return Err(HdbError::CorruptedData(
@@ -67,7 +77,6 @@ impl AliceClient {
 
         match self.call(Request::AuthProof { client_proof })? {
             Response::AuthSuccess { server_signature } => {
-                // Constant-time verification of server signature (mutual authentication)
                 let mut diff: u8 = 0;
                 for (a, b) in server_signature.iter().zip(expected_server_sig.iter()) {
                     diff |= a ^ b;
@@ -90,32 +99,45 @@ impl AliceClient {
     }
 }
 
-/// TCP Server wrapper around `Database` supporting Active/Standby modes and SCRAM-SHA-256 auth.
+/// TCP Server wrapper around `Database` supporting Active/Standby modes, SCRAM auth,
+/// and configurable connection limits/timeouts.
 pub struct AliceServer {
     db: Arc<Database>,
     auth: Arc<AuthRegistry>,
+    server_cfg: ServerConfig,
+    active_conns: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl AliceServer {
     pub fn new(db: Arc<Database>) -> Self {
-        Self {
-            db,
-            auth: Arc::new(AuthRegistry::new()),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
+        Self::with_config(db, Arc::new(AuthRegistry::new()), ServerConfig::default())
     }
 
     pub fn with_auth(db: Arc<Database>, auth: Arc<AuthRegistry>) -> Self {
+        Self::with_config(db, auth, ServerConfig::default())
+    }
+
+    pub fn with_config(
+        db: Arc<Database>,
+        auth: Arc<AuthRegistry>,
+        server_cfg: ServerConfig,
+    ) -> Self {
         Self {
             db,
             auth,
+            server_cfg,
+            active_conns: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn auth_registry(&self) -> Arc<AuthRegistry> {
         Arc::clone(&self.auth)
+    }
+
+    pub fn active_connections(&self) -> usize {
+        self.active_conns.load(Ordering::SeqCst)
     }
 
     pub fn shutdown(&self) {
@@ -132,17 +154,41 @@ impl AliceServer {
 
         let db = Arc::clone(&self.db);
         let auth = Arc::clone(&self.auth);
+        let active_conns = Arc::clone(&self.active_conns);
         let shutdown = Arc::clone(&self.shutdown);
+        let max_connections = self.server_cfg.max_connections;
+        let read_timeout = Duration::from_millis(self.server_cfg.read_timeout_ms);
 
         thread::spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((mut stream, _)) => {
+                        let current = active_conns.load(Ordering::SeqCst);
+                        if current >= max_connections {
+                            let (t, b) = encode_response(&Response::Err(
+                                "Max connections limit reached".into(),
+                            ));
+                            let _ = write_frame(&mut stream, t, &b);
+                            continue;
+                        }
+
+                        active_conns.fetch_add(1, Ordering::SeqCst);
+                        let guard = ActiveConnGuard {
+                            counter: Arc::clone(&active_conns),
+                        };
+
                         let db_conn = Arc::clone(&db);
                         let auth_conn = Arc::clone(&auth);
                         let shutdown_conn = Arc::clone(&shutdown);
                         thread::spawn(move || {
-                            let _ = handle_connection(stream, db_conn, auth_conn, shutdown_conn);
+                            let _guard = guard;
+                            let _ = handle_connection(
+                                stream,
+                                db_conn,
+                                auth_conn,
+                                shutdown_conn,
+                                read_timeout,
+                            );
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -160,8 +206,6 @@ impl AliceServer {
         self.start_standby_replication_with_auth(primary_addr, poll_interval, None);
     }
 
-    /// Starts background WAL replication loop pulling changes (with optional SCRAM credentials
-    /// and automatic snapshot fallback).
     pub fn start_standby_replication_with_auth(
         &self,
         primary_addr: String,
@@ -235,9 +279,10 @@ fn handle_connection(
     db: Arc<Database>,
     auth: Arc<AuthRegistry>,
     shutdown: Arc<AtomicBool>,
+    read_timeout: Duration,
 ) -> Result<(), HdbError> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
 
     let auth_required = auth.is_enabled().unwrap_or(true);
     if auth_required && !perform_server_handshake(&mut stream, &auth, &shutdown)? {
@@ -269,13 +314,11 @@ fn handle_connection(
     Ok(())
 }
 
-/// Runs the 2-step SCRAM-SHA-256 handshake before allowing any database RPCs.
 fn perform_server_handshake(
     stream: &mut TcpStream,
     auth: &AuthRegistry,
     shutdown: &AtomicBool,
 ) -> Result<bool, HdbError> {
-    // Step 1: Expect AuthHello
     let (tag1, body1) = loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(false);
@@ -322,7 +365,6 @@ fn perform_server_handshake(
     });
     write_frame(stream, ct, &cb)?;
 
-    // Step 2: Expect AuthProof
     let (tag2, body2) = loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(false);
