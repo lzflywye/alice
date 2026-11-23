@@ -2,12 +2,12 @@ use crate::auth::{
     AuthRegistry, build_auth_message, compute_client_proof, generate_nonce, verify_client_proof,
 };
 use crate::config::ServerConfig;
-use crate::protocol::{
+use crate::framing::{read_frame, write_frame};
+use crate::hierarchical_proto::{
     Request, Response, decode_request, decode_response, encode_request, encode_response,
-    read_frame, write_frame,
 };
-use alice_core::db::Database;
-use alice_core::error::HdbError;
+use common::DbError;
+use hierarchical::Database;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,13 +24,12 @@ impl Drop for ActiveConnGuard {
     }
 }
 
-/// Synchronous TCP client supporting unauthenticated and SCRAM-SHA-256 authenticated sessions.
-pub struct AliceClient {
+pub struct HierarchicalClient {
     stream: TcpStream,
 }
 
-impl AliceClient {
-    pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self, HdbError> {
+impl HierarchicalClient {
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self, DbError> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
         Ok(Self { stream })
@@ -40,14 +39,13 @@ impl AliceClient {
         addr: A,
         username: &str,
         password: &str,
-    ) -> Result<Self, HdbError> {
+    ) -> Result<Self, DbError> {
         let mut client = Self::connect(addr)?;
         client.authenticate(username, password)?;
         Ok(client)
     }
 
-    /// Performs mutual SCRAM-SHA-256 authentication with the server.
-    pub fn authenticate(&mut self, username: &str, password: &str) -> Result<(), HdbError> {
+    pub fn authenticate(&mut self, username: &str, password: &str) -> Result<(), DbError> {
         let client_nonce = generate_nonce()?;
         let resp = self.call(Request::AuthHello {
             username: username.to_string(),
@@ -60,38 +58,36 @@ impl AliceClient {
                 iterations,
                 combined_nonce,
             } => (salt, iterations, combined_nonce),
-            Response::Err(_) => return Err(HdbError::CorruptedData("Authentication rejected")),
-            _ => return Err(HdbError::CorruptedData("Unexpected response to AuthHello")),
+            Response::Err(_) => return Err(DbError::CorruptedData("Authentication rejected")),
+            _ => return Err(DbError::CorruptedData("Unexpected response to AuthHello")),
         };
 
         if !combined_nonce.starts_with(&client_nonce) || combined_nonce.len() <= client_nonce.len()
         {
-            return Err(HdbError::CorruptedData(
-                "Invalid combined nonce from server",
-            ));
+            return Err(DbError::CorruptedData("Invalid combined nonce from server"));
         }
 
         let auth_msg = build_auth_message(username, &combined_nonce, &salt);
         let (client_proof, expected_server_sig) =
             compute_client_proof(password, &salt, iterations, &auth_msg)?;
 
-        match self.call(Request::AuthProof { client_proof })? {
+        match self.call(Request::AuthProof { client_proof: client_proof.to_vec() })? {
             Response::AuthSuccess { server_signature } => {
                 let mut diff: u8 = 0;
                 for (a, b) in server_signature.iter().zip(expected_server_sig.iter()) {
                     diff |= a ^ b;
                 }
                 if diff != 0 {
-                    return Err(HdbError::CorruptedData("Server signature mismatch"));
+                    return Err(DbError::CorruptedData("Server signature mismatch"));
                 }
                 Ok(())
             }
-            Response::Err(_) => Err(HdbError::CorruptedData("Invalid credentials")),
-            _ => Err(HdbError::CorruptedData("Unexpected response to AuthProof")),
+            Response::Err(_) => Err(DbError::CorruptedData("Invalid credentials")),
+            _ => Err(DbError::CorruptedData("Unexpected response to AuthProof")),
         }
     }
 
-    pub fn call(&mut self, req: Request) -> Result<Response, HdbError> {
+    pub fn call(&mut self, req: Request) -> Result<Response, DbError> {
         let (tag, body) = encode_request(&req);
         write_frame(&mut self.stream, tag, &body)?;
         let (resp_tag, resp_body) = read_frame(&mut self.stream)?;
@@ -99,9 +95,7 @@ impl AliceClient {
     }
 }
 
-/// TCP Server wrapper around `Database` supporting Active/Standby modes, SCRAM auth,
-/// and configurable connection limits/timeouts.
-pub struct AliceServer {
+pub struct HierarchicalServer {
     db: Arc<Database>,
     auth: Arc<AuthRegistry>,
     server_cfg: ServerConfig,
@@ -109,7 +103,7 @@ pub struct AliceServer {
     shutdown: Arc<AtomicBool>,
 }
 
-impl AliceServer {
+impl HierarchicalServer {
     pub fn new(db: Arc<Database>) -> Self {
         Self::with_config(db, Arc::new(AuthRegistry::new()), ServerConfig::default())
     }
@@ -147,7 +141,7 @@ impl AliceServer {
     pub fn start_listener<A: ToSocketAddrs>(
         &self,
         bind_addr: A,
-    ) -> Result<std::net::SocketAddr, HdbError> {
+    ) -> Result<std::net::SocketAddr, DbError> {
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
@@ -219,15 +213,15 @@ impl AliceServer {
         let shutdown = Arc::clone(&self.shutdown);
 
         thread::spawn(move || {
-            let mut client: Option<AliceClient> = None;
+            let mut client: Option<HierarchicalClient> = None;
 
             while !shutdown.load(Ordering::SeqCst) {
                 if client.is_none() {
                     let conn_res = match &credentials {
                         Some((user, pass)) => {
-                            AliceClient::connect_with_auth(&primary_addr, user, pass)
+                            HierarchicalClient::connect_with_auth(&primary_addr, user, pass)
                         }
-                        None => AliceClient::connect(&primary_addr),
+                        None => HierarchicalClient::connect(&primary_addr),
                     };
 
                     if let Ok(mut c) = conn_res {
@@ -280,7 +274,7 @@ fn handle_connection(
     auth: Arc<AuthRegistry>,
     shutdown: Arc<AtomicBool>,
     read_timeout: Duration,
-) -> Result<(), HdbError> {
+) -> Result<(), DbError> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(read_timeout))?;
 
@@ -292,7 +286,7 @@ fn handle_connection(
     while !shutdown.load(Ordering::SeqCst) {
         let (tag, body) = match read_frame(&mut stream) {
             Ok(frame) => frame,
-            Err(HdbError::Io(ref e))
+            Err(DbError::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
@@ -318,14 +312,14 @@ fn perform_server_handshake(
     stream: &mut TcpStream,
     auth: &AuthRegistry,
     shutdown: &AtomicBool,
-) -> Result<bool, HdbError> {
+) -> Result<bool, DbError> {
     let (tag1, body1) = loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(false);
         }
         match read_frame(stream) {
             Ok(frame) => break frame,
-            Err(HdbError::Io(ref e))
+            Err(DbError::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
@@ -371,7 +365,7 @@ fn perform_server_handshake(
         }
         match read_frame(stream) {
             Ok(frame) => break frame,
-            Err(HdbError::Io(ref e))
+            Err(DbError::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {

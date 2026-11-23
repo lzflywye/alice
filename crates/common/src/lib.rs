@@ -95,3 +95,20 @@ const fn generate_crc32_table() -> [u32; 256] {
     }
     table
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_crc32_standard_vector_and_bit_flip() {
+        // Standard IEEE 802.3 CRC32 check value for "123456789"
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0x0000_0000);
+
+        let original = b"AliceDB_storage_integrity_check";
+        let mut tampered = *original;
+        tampered[10] ^= 0x01; // Flip a single bit
+        assert_ne!(crc32(original), crc32(&tampered));
+    }
+}

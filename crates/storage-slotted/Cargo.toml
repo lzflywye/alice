@@ -1,6 +1,7 @@
 [package]
-name = "alice-core"
+name = "storage-slotted"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+common = { path = "../common" }

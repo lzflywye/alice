@@ -1,4 +1,4 @@
-use common::{crc32, DbError};
+use common::{DbError, crc32};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -115,12 +115,13 @@ impl WalManager {
             return Ok(Vec::new());
         }
         if let Some(oldest) = self.backlog.front()
-            && after_lsn + 1 < oldest.lsn {
-                return Err(DbError::ReplicationLag {
-                    requested_after_lsn: after_lsn,
-                    oldest_available_lsn: oldest.lsn,
-                });
-            }
+            && after_lsn + 1 < oldest.lsn
+        {
+            return Err(DbError::ReplicationLag {
+                requested_after_lsn: after_lsn,
+                oldest_available_lsn: oldest.lsn,
+            });
+        }
         Ok(self
             .backlog
             .iter()
@@ -171,9 +172,10 @@ fn list_segment_ids(dir: &Path) -> Result<Vec<u64>, DbError> {
         if let Some(num_part) = name_str
             .strip_prefix("wal_")
             .and_then(|s| s.strip_suffix(".log"))
-            && let Ok(id) = num_part.parse::<u64>() {
-                ids.push(id);
-            }
+            && let Ok(id) = num_part.parse::<u64>()
+        {
+            ids.push(id);
+        }
     }
     ids.sort_unstable();
     Ok(ids)
@@ -257,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_wal_append_recover_and_purge() {
-        let dir = std::env::temp_dir().join(format!("wal_generic_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wal_basic_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
         {
@@ -265,6 +267,7 @@ mod tests {
             assert!(recovered.is_empty());
             assert_eq!(wal.append(b"op1".to_vec()).unwrap(), 1);
             assert_eq!(wal.append(b"op2".to_vec()).unwrap(), 2);
+            assert_eq!(wal.current_lsn(), 2);
         }
 
         {
@@ -283,6 +286,62 @@ mod tests {
             assert_eq!(recovered[0].lsn, 3);
             assert_eq!(recovered[0].payload, b"op3");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_segment_rotation_and_fetch_since() {
+        let dir = std::env::temp_dir().join(format!("wal_rot_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Minimum segment size is clamped to 1024B; write enough records to trigger multiple rotations
+        let (mut wal, _) = WalManager::open(&dir, 1024).unwrap();
+        let payload = vec![0xABu8; 300];
+        for i in 1..=20 {
+            assert_eq!(wal.append(payload.clone()).unwrap(), i);
+        }
+
+        // Oldest archived segments beyond 3 must be cleaned up automatically
+        let seg_ids = list_segment_ids(&dir).unwrap();
+        assert!(seg_ids.len() <= 3);
+        assert!(*seg_ids.last().unwrap() > 1);
+
+        // Incremental fetch
+        let batch = wal.fetch_since(17).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].lsn, 18);
+        assert_eq!(batch[2].lsn, 20);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_wal_torn_tail_and_crc_corruption_recovery() {
+        let dir = std::env::temp_dir().join(format!("wal_corrupt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        {
+            let (mut wal, _) = WalManager::open(&dir, 65536).unwrap();
+            wal.append(b"valid_1".to_vec()).unwrap();
+            wal.append(b"valid_2".to_vec()).unwrap();
+            wal.append(b"corrupted_tail".to_vec()).unwrap();
+        }
+
+        // Corrupt the last byte (CRC32) of the 3rd record to simulate power loss mid-write
+        let seg_file = segment_path(&dir, 1);
+        let mut raw = fs::read(&seg_file).unwrap();
+        let last_idx = raw.len() - 1;
+        raw[last_idx] ^= 0xFF;
+        fs::write(&seg_file, &raw).unwrap();
+
+        // Recovery must preserve the first 2 valid records and cleanly discard the damaged tail
+        let (mut wal, recovered) = WalManager::open(&dir, 65536).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].payload, b"valid_1");
+        assert_eq!(recovered[1].payload, b"valid_2");
+        assert_eq!(wal.current_lsn(), 2);
+        assert_eq!(wal.append(b"after_recovery".to_vec()).unwrap(), 3);
 
         let _ = fs::remove_dir_all(&dir);
     }

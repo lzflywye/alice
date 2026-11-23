@@ -1,10 +1,10 @@
-use common::{crc32, DbError};
+use common::{DbError, crc32};
 use erasure::ReedSolomon;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use storage_lsm::{KvPair, LsmEngine, DEFAULT_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_MAX_BYTES};
+use storage_lsm::{DEFAULT_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_MAX_BYTES, KvPair, LsmEngine};
 use wal::DEFAULT_WAL_SEGMENT_BYTES;
 
 const NO_EXPIRY: u64 = 0;
@@ -191,16 +191,17 @@ impl KvStore {
             let file_path = dir.join(format!("kv_snap_shard_{idx:03}.ec"));
             if let Ok(bytes) = fs::read(&file_path)
                 && let Ok((shard_idx, parsed_orig_len, payload)) = decode_shard_file(&bytes)
-                    && shard_idx as usize == idx {
-                        if let Some(expected) = orig_len {
-                            if parsed_orig_len as usize != expected {
-                                continue;
-                            }
-                        } else {
-                            orig_len = Some(parsed_orig_len as usize);
-                        }
-                        shards[idx] = Some(payload);
+                && shard_idx as usize == idx
+            {
+                if let Some(expected) = orig_len {
+                    if parsed_orig_len as usize != expected {
+                        continue;
                     }
+                } else {
+                    orig_len = Some(parsed_orig_len as usize);
+                }
+                shards[idx] = Some(payload);
+            }
         }
 
         let orig_len = orig_len.ok_or(DbError::CorruptedData("No valid erasure shards found"))?;
@@ -329,50 +330,105 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_kv_ttl_cas_and_rs_10_4_snapshot() {
-        let base = std::env::temp_dir().join(format!("kv_rs_test_{}", std::process::id()));
+    fn test_kv_cas_insert_update_delete() {
+        let dir = std::env::temp_dir().join(format!("kv_cas_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let kv = KvStore::open(&dir).unwrap();
+
+        // Put-If-Absent (expected = None) succeeds only once
+        assert!(
+            kv.compare_and_swap(b"lock:job1", None, Some(b"worker_a"))
+                .unwrap()
+        );
+        assert!(
+            !kv.compare_and_swap(b"lock:job1", None, Some(b"worker_b"))
+                .unwrap()
+        );
+        assert_eq!(kv.get(b"lock:job1").unwrap(), Some(b"worker_a".to_vec()));
+
+        // Conditional update
+        assert!(
+            kv.compare_and_swap(b"lock:job1", Some(b"worker_a"), Some(b"worker_b"))
+                .unwrap()
+        );
+        assert_eq!(kv.get(b"lock:job1").unwrap(), Some(b"worker_b".to_vec()));
+
+        // Conditional delete (new_value = None)
+        assert!(
+            !kv.compare_and_swap(b"lock:job1", Some(b"wrong"), None)
+                .unwrap()
+        );
+        assert!(
+            kv.compare_and_swap(b"lock:job1", Some(b"worker_b"), None)
+                .unwrap()
+        );
+        assert_eq!(kv.get(b"lock:job1").unwrap(), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kv_ttl_expiration_and_scan_filtering() {
+        let dir = std::env::temp_dir().join(format!("kv_ttl_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let kv = KvStore::open(&dir).unwrap();
+        kv.put(b"item:permanent", b"keep").unwrap();
+        kv.put_with_ttl(b"item:ephemeral", b"temp", 40).unwrap();
+
+        assert_eq!(kv.scan_prefix(b"item:").unwrap().len(), 2);
+
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(kv.get(b"item:ephemeral").unwrap(), None);
+
+        let live = kv.scan_prefix(b"item:").unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0], (b"item:permanent".to_vec(), b"keep".to_vec()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_kv_rs_10_4_snapshot_corruption_and_missing_recovery() {
+        let base = std::env::temp_dir().join(format!("kv_rs_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
 
         let kv = KvStore::open(base.join("primary")).unwrap();
+        for i in 0..25 {
+            kv.put(
+                format!("key:{i:02}").as_bytes(),
+                format!("value_payload_{i}").as_bytes(),
+            )
+            .unwrap();
+        }
 
-        // 1. Basic Put / Get / CAS
-        kv.put(b"config:version", b"1").unwrap();
-        assert!(!kv
-            .compare_and_swap(b"config:version", Some(b"0"), Some(b"2"))
-            .unwrap());
-        assert!(kv
-            .compare_and_swap(b"config:version", Some(b"1"), Some(b"2"))
-            .unwrap());
-        assert_eq!(kv.get(b"config:version").unwrap(), Some(b"2".to_vec()));
-
-        // 2. TTL expiration
-        kv.put_with_ttl(b"session:temp", b"token_xyz", 40).unwrap();
-        assert_eq!(
-            kv.get(b"session:temp").unwrap(),
-            Some(b"token_xyz".to_vec())
-        );
-        thread::sleep(Duration::from_millis(60));
-        assert_eq!(kv.get(b"session:temp").unwrap(), None);
-
-        // 3. Export snapshot across 14 simulated disks using RS(10, 4)
         let shard_dirs: Vec<PathBuf> = (0..14).map(|i| base.join(format!("disk_{i:02}"))).collect();
         kv.export_erasure_snapshot(&shard_dirs, 10, 4).unwrap();
 
-        // Destroy 4 disks (2 data disks + 2 parity disks)
-        fs::remove_dir_all(&shard_dirs[0]).unwrap();
-        fs::remove_dir_all(&shard_dirs[5]).unwrap();
-        fs::remove_dir_all(&shard_dirs[10]).unwrap();
-        fs::remove_dir_all(&shard_dirs[13]).unwrap();
+        // Delete 2 shard directories completely
+        fs::remove_dir_all(&shard_dirs[1]).unwrap();
+        fs::remove_dir_all(&shard_dirs[11]).unwrap();
 
-        // Restore into a brand-new KvStore instance from the surviving 10 shards
+        // Corrupt 1 byte inside 2 surviving shard files (bit-rot simulation)
+        for &corrupt_idx in &[3usize, 8usize] {
+            let shard_file =
+                shard_dirs[corrupt_idx].join(format!("kv_snap_shard_{corrupt_idx:03}.ec"));
+            let mut raw = fs::read(&shard_file).unwrap();
+            let mid = raw.len() / 2;
+            raw[mid] ^= 0x5A;
+            fs::write(&shard_file, &raw).unwrap();
+        }
+
+        // Reconstruct from the remaining 10 intact shards
         let restored_kv = KvStore::open(base.join("restored")).unwrap();
-        let restored_count = restored_kv
+        let count = restored_kv
             .restore_erasure_snapshot(&shard_dirs, 10, 4)
             .unwrap();
-        assert_eq!(restored_count, 1);
+        assert_eq!(count, 25);
         assert_eq!(
-            restored_kv.get(b"config:version").unwrap(),
-            Some(b"2".to_vec())
+            restored_kv.get(b"key:24").unwrap(),
+            Some(b"value_payload_24".to_vec())
         );
 
         let _ = fs::remove_dir_all(&base);

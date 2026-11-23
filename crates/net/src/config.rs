@@ -1,9 +1,9 @@
-use alice_core::error::HdbError;
+use common::DbError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AliceConfig {
     pub server: ServerConfig,
@@ -46,17 +46,6 @@ pub struct UserEntry {
     pub password: String,
 }
 
-impl Default for AliceConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            replication: ReplicationConfig::default(),
-            auth: AuthConfig::default(),
-        }
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -86,10 +75,10 @@ impl Default for ReplicationConfig {
 }
 
 impl AliceConfig {
-    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, HdbError> {
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let content = fs::read_to_string(path)?;
         toml::from_str(&content)
-            .map_err(|_| HdbError::CorruptedData("Failed to parse TOML configuration"))
+            .map_err(|_| DbError::CorruptedData("Failed to parse TOML configuration"))
     }
 
     pub fn sample_toml() -> String {

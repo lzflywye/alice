@@ -1,0 +1,9 @@
+[package]
+name = "hierarchical"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+storage-slotted = { path = "../storage-slotted" }
+wal = { path = "../wal" }

@@ -1,9 +1,0 @@
-[package]
-name = "alice-cli"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-alice-core = { path = "../alice-core" }
-alice-server = { path = "../alice-server" }
-rustyline.workspace = true

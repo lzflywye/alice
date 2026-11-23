@@ -1,0 +1,10 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+hierarchical = { path = "../hierarchical" }
+net = { path = "../net" }
+rustyline.workspace = true

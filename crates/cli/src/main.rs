@@ -1,9 +1,7 @@
-use alice_core::db::{Database, NodeView};
-use alice_core::schema::{ColumnDef, DataType, Decimal, SegmentSchema, Value};
-use alice_server::auth::AuthRegistry;
-use alice_server::config::AliceConfig;
-use alice_server::protocol::{Request, Response};
-use alice_server::server::{AliceClient, AliceServer};
+use hierarchical::{ColumnDef, DataType, Database, Decimal, NodeView, SegmentSchema, Value};
+use net::{
+    AliceConfig, AuthRegistry, HierarchicalClient, HierarchicalServer, Request, Response, UserEntry,
+};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
@@ -25,7 +23,7 @@ fn main() {
             println!("Generated sample config at {out_path}");
         }
         "server" => {
-            let mut cfg = AliceConfig::default();
+            let mut cfg: AliceConfig = AliceConfig::default();
             let mut positional = Vec::new();
             let mut i = 2;
 
@@ -39,7 +37,7 @@ fn main() {
                     }
                     "--auth" => {
                         if let Some((u, p)) = args.get(i + 1).and_then(|s| parse_cred(s)) {
-                            cfg.auth.users.push(alice_server::config::UserEntry {
+                            cfg.auth.users.push(UserEntry {
                                 username: u,
                                 password: p,
                             });
@@ -79,7 +77,7 @@ fn main() {
                     .expect("Failed to register SCRAM user");
             }
 
-            let srv = AliceServer::with_config(Arc::clone(&db), auth, cfg.server.clone());
+            let srv = HierarchicalServer::with_config(Arc::clone(&db), auth, cfg.server.clone());
             let bound = srv
                 .start_listener(&cfg.server.bind_addr)
                 .expect("Failed to bind listener");
@@ -150,7 +148,7 @@ impl ReplState {
         }
     }
 
-    fn refresh_schemas(&mut self, client: &mut AliceClient) {
+    fn refresh_schemas(&mut self, client: &mut HierarchicalClient) {
         if let Ok(Response::OkCatalog(list)) = client.call(Request::SyncCatalog) {
             self.schemas = list.into_iter().map(|s| (s.node_type, s)).collect();
         }
@@ -184,9 +182,9 @@ impl ReplState {
 
 fn run_repl(addr: &str, auth_pair: Option<(String, String)>) {
     let mut client = match auth_pair {
-        Some((user, pass)) => AliceClient::connect_with_auth(addr, &user, &pass)
+        Some((user, pass)) => HierarchicalClient::connect_with_auth(addr, &user, &pass)
             .expect("Failed to connect/authenticate to AliceDB server"),
-        None => AliceClient::connect(addr).expect("Failed to connect to AliceDB server"),
+        None => HierarchicalClient::connect(addr).expect("Failed to connect to AliceDB server"),
     };
 
     let mut state = ReplState::new();
@@ -354,7 +352,7 @@ fn print_help() {
     println!("  ping / quit");
 }
 
-fn handle_pwd(client: &mut AliceClient, state: &ReplState) {
+fn handle_pwd(client: &mut HierarchicalClient, state: &ReplState) {
     if state.cwd == 0 {
         println!("/ (root)");
         return;
@@ -378,7 +376,7 @@ fn handle_pwd(client: &mut AliceClient, state: &ReplState) {
     println!("/{}", chain.join(" / "));
 }
 
-fn handle_cd(client: &mut AliceClient, state: &mut ReplState, target: &str) {
+fn handle_cd(client: &mut HierarchicalClient, state: &mut ReplState, target: &str) {
     match target {
         "/" | "0" => {
             state.cwd = 0;
@@ -445,7 +443,7 @@ fn handle_cd(client: &mut AliceClient, state: &mut ReplState, target: &str) {
     }
 }
 
-fn handle_ls(client: &mut AliceClient, state: &ReplState) {
+fn handle_ls(client: &mut HierarchicalClient, state: &ReplState) {
     if state.cwd == 0 {
         println!("(At virtual root '/': use 'cd <node_id | label>' or 'find <type> <col> <val>')");
         return;
@@ -475,7 +473,7 @@ fn handle_ls(client: &mut AliceClient, state: &ReplState) {
     }
 }
 
-fn handle_tree(client: &mut AliceClient, state: &ReplState, max_depth: Option<usize>) {
+fn handle_tree(client: &mut HierarchicalClient, state: &ReplState, max_depth: Option<usize>) {
     if state.cwd == 0 {
         println!("(At virtual root '/': 'cd <node_id | label>' first to inspect a subtree)");
         return;
