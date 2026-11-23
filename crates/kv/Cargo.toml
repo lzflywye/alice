@@ -1,0 +1,10 @@
+[package]
+name = "kv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+erasure = { path = "../erasure" }
+storage-lsm = { path = "../storage-lsm" }
+wal = { path = "../wal" }
