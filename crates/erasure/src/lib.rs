@@ -263,11 +263,15 @@ mod tests {
         damaged[0] = None;
         damaged[2] = None;
 
+        // `reconstruct` repairs `damaged[0]` and `damaged[2]` in-place
         let recovered = rs.reconstruct(&mut damaged, orig_len).unwrap();
         assert_eq!(recovered, original);
+        assert!(damaged[0].is_some() && damaged[2].is_some());
 
-        // Simulate losing 3 shards (exceeds m=2 parity shards) -> must fail cleanly
+        // Simulate losing 3 shards at once (exceeds m=2 parity shards) -> must fail cleanly
+        damaged[0] = None;
         damaged[1] = None;
+        damaged[2] = None;
         assert!(rs.reconstruct(&mut damaged, orig_len).is_err());
     }
 }
