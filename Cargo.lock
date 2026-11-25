@@ -58,7 +58,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
  "hierarchical",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "dunce"
@@ -108,7 +108,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "erasure"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
 ]
@@ -150,7 +150,7 @@ checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
 name = "hierarchical"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
  "storage-slotted",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "kv"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
  "erasure",
@@ -216,7 +216,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "net"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aws-lc-rs",
  "common",
@@ -284,6 +284,15 @@ checksum = "3b4431027dcd37fc2a73ef740b5f233aa805897935b8bce0195e41bbf9a3289a"
 dependencies = [
  "endian-type",
  "nibble_vec",
+]
+
+[[package]]
+name = "relational"
+version = "0.5.0"
+dependencies = [
+ "common",
+ "rustyline",
+ "storage-btree",
 ]
 
 [[package]]
@@ -358,8 +367,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
+name = "storage-btree"
+version = "0.5.0"
+dependencies = [
+ "common",
+ "wal",
+]
+
+[[package]]
 name = "storage-lsm"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
  "wal",
@@ -367,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "storage-slotted"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
 ]
@@ -454,7 +471,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "wal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "common",
 ]

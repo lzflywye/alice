@@ -1,0 +1,11 @@
+[package]
+name = "relational"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+storage-btree = { path = "../storage-btree" }
+
+[dev-dependencies]
+rustyline.workspace = true

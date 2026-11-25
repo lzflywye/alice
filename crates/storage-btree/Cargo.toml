@@ -1,0 +1,8 @@
+[package]
+name = "storage-btree"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+wal = { path = "../wal" }
