@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use storage_lsm::{DEFAULT_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_MAX_BYTES, KvPair, LsmEngine};
+use storage_lsm::{DEFAULT_L0_COMPACTION_TRIGGER, DEFAULT_MEMTABLE_MAX_BYTES, KvPair, LsmEngine};
 use wal::DEFAULT_WAL_SEGMENT_BYTES;
 
 const NO_EXPIRY: u64 = 0;
@@ -22,7 +22,7 @@ impl KvStore {
         Self::open_with_options(
             dir,
             DEFAULT_MEMTABLE_MAX_BYTES,
-            DEFAULT_COMPACTION_TRIGGER,
+            DEFAULT_L0_COMPACTION_TRIGGER,
             DEFAULT_WAL_SEGMENT_BYTES,
         )
     }
